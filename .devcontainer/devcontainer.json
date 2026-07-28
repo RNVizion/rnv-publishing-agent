@@ -7,7 +7,7 @@
     "codespaces": {
       "repositories": {
         "RNVizion/rnvizion.github.io": { "permissions": { "contents": "write" } },
-        "RNVizion/ask-the-corpus": { "permissions": { "contents": "write" } }
+        "RNVizion/rnv-ask-the-corpus": { "permissions": { "contents": "write" } }
       }
     }
   }
