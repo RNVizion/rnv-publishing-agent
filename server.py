@@ -13,7 +13,7 @@ mcp = FastMCP("rnv-publishing")
 
 BLOG_REPO = Path(os.environ.get("BLOG_REPO", "/workspaces/rnvizion.github.io"))
 SITE_URL = os.environ.get("SITE_URL", "https://rnvizion.dev")
-CORPUS_REPO = Path(os.environ.get("CORPUS_REPO", "/workspaces/ask-the-corpus"))
+CORPUS_REPO = Path(os.environ.get("CORPUS_REPO", "/workspaces/rnv-ask-the-corpus"))
 
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
