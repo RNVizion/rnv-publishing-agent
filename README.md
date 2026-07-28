@@ -90,7 +90,7 @@ Environment:
 
 - `ANTHROPIC_API_KEY` — the reasoning model
 - `BLOG_REPO` — path to the site checkout (default `/workspaces/rnvizion.github.io`)
-- `CORPUS_REPO` — path to the corpus checkout (default `/workspaces/ask-the-corpus`)
+- `CORPUS_REPO` — path to the corpus checkout (default `/workspaces/rnv-ask-the-corpus`)
 - `SITE_URL` — live origin for `wait_for_live` (default `https://rnvizion.dev`)
 
 Dependencies: the Anthropic SDK and the MCP SDK. Install with `pip install -r requirements.txt`. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
