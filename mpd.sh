@@ -1,1 +1,0 @@
-python agent.py "Publish blog/the-job-was-never-coding as a dry run."
