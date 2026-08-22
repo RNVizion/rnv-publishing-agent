@@ -1,8 +1,27 @@
 import asyncio
+import os
 import sys
 from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import stdio_client, get_default_environment
+
+# mcp.client.stdio hands the child a filtered environment — HOME, LOGNAME, PATH,
+# SHELL, TERM, USER and nothing else — so BLOG_REPO, CORPUS_REPO and SITE_URL
+# never reached server.py and its hardcoded defaults always won. BLOG_REPO only
+# looked configured because its default matched the Codespace clone path.
+# sys.executable rather than "python": under a venv the two are not the same
+# interpreter, and the child needs the one that has mcp installed.
+PASS_THROUGH = ("BLOG_REPO", "CORPUS_REPO", "SITE_URL")
+
+
+def server_env():
+    env = get_default_environment()
+    for key in PASS_THROUGH:
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
 
 MODEL = "claude-sonnet-4-6"   # the publish chain is short but multi-step; Sonnet keeps the one decision reliable
 llm = Anthropic()             # reads ANTHROPIC_API_KEY from the environment
@@ -24,7 +43,9 @@ def to_anthropic(mcp_tools):
             for t in mcp_tools.tools]
 
 async def run(request):
-    params = StdioServerParameters(command="python", args=["server.py"])
+    params = StdioServerParameters(
+        command=sys.executable, args=["server.py"], env=server_env()
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()

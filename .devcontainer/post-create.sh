@@ -2,7 +2,8 @@
 set -euo pipefail
 
 pip install --upgrade pip
-pip install -r /workspaces/publishing-agent/requirements.txt
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+pip install -r "$REPO_ROOT/requirements.txt"
 
 clone_or_update () {
   local slug="$1"
@@ -17,6 +18,6 @@ clone_or_update () {
 }
 
 clone_or_update "RNVizion/rnvizion.github.io"
-clone_or_update "RNVizion/ask-the-corpus"
+clone_or_update "RNVizion/rnv-ask-the-corpus"
 
 echo "post-create: site and corpus repos ready under /workspaces"
