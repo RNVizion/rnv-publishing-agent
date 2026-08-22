@@ -1,4 +1,5 @@
-"""Guard: the for_real gate holds, and a dry run writes nothing.
+"""
+Guard: the for_real gate holds, and a dry run writes nothing.
 
 Replaces client_test.py, which called insert_card — a tool the server does not
 expose — and printed its results instead of asserting them, so it reported the
@@ -11,8 +12,13 @@ What this guards (Publishing Systems principle 7, gate the irreversible):
   3. The blog checkout is byte-unchanged after a dry run.
   4. validate_post fails closed on a slug that does not exist.
 
-Run from the repo root:  python tests/test_publish_gate.py
-Reads BLOG_REPO if set; otherwise the server's own default applies.
+The working directory does not matter; paths are anchored to this file.
+Invoke by whatever path reaches it:
+
+    python tests/test_publish_gate.py                 # from the repo root
+    python /workspaces/rnv-publishing-agent/tests/test_publish_gate.py
+
+BLOG_REPO is forwarded to the server if set; otherwise the server's default applies. 
 """
 
 import asyncio
