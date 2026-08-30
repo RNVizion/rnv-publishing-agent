@@ -2,7 +2,7 @@
 import json
 import subprocess
 
-from conftest import git_log, write_post
+from conftest import git_log, sitemap_xml, write_post
 
 
 def _remote_log(remote):
@@ -14,6 +14,7 @@ def _remote_log(remote):
 def test_full_publish_runs_every_step_in_order(blog, blog_remote, corpus, site, srv, fake_web):
     write_post(blog, "ready", site)
     fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
     fake_web[f"{site}/assets/og/ready.png"] = 200
 
     result = srv.publish_post("ready", for_real=True)
@@ -29,6 +30,7 @@ def test_a_real_publish_actually_pushes(blog, blog_remote, corpus, site, srv, fa
     """Not a mock: the commit lands in the bare remote."""
     write_post(blog, "ready", site)
     fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
     fake_web[f"{site}/assets/og/ready.png"] = 200
 
     srv.publish_post("ready", for_real=True)
@@ -47,6 +49,7 @@ def test_lagging_og_image_warns_but_does_not_fail(blog, blog_remote, corpus, sit
     """
     write_post(blog, "ready", site)
     fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
     fake_web[f"{site}/assets/og/ready.png"] = 404
 
     result = srv.publish_post("ready", for_real=True)
@@ -54,7 +57,7 @@ def test_lagging_og_image_warns_but_does_not_fail(blog, blog_remote, corpus, sit
     assert result["ok"] is True, "a lagging image must not fail the publish"
     assert result["published"] is True
     assert result["warnings"], "a lagging image must not pass silently either"
-    assert "og:image not live" in result["warnings"][0]
+    assert any("og:image not live" in w for w in result["warnings"])
 
 
 def test_page_that_never_goes_live_stops_the_chain(blog, blog_remote, corpus, site, srv, fake_web):
@@ -133,3 +136,85 @@ def test_list_posts_reads_slug_title_and_date(blog, site, srv):
     assert by_slug["squish"]["title"] == "Squish"
     assert by_slug["margin"]["title"] == "The Margin, Not the Price"
     assert by_slug["squish"]["published"] == "2026-08-19T09:00:00Z"
+
+
+def test_lagging_sitemap_warns_but_does_not_fail(blog, blog_remote, corpus, site, srv, fake_web):
+    """Wave two lagging is a warning, not a gate.
+
+    The post page is live, so the post itself deployed. The sitemap has not caught up,
+    which means build-feed has not regenerated the index and feed yet. That is another
+    process running late, not this post being wrong, so it warns and continues.
+    """
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "some-older-post"))
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    result = srv.publish_post("ready", for_real=True)
+
+    assert result["ok"] is True, "a lagging sitemap must not fail the publish"
+    assert result["published"] is True
+    assert any("does not list" in w for w in result["warnings"])
+
+
+def test_sitemap_that_catches_up_produces_no_warning(blog, blog_remote, corpus, site, srv, fake_web):
+    """The poll keeps looking, so a sitemap that lands in time is not reported late.
+
+    This is the counterpart that makes the leniency leniency rather than blindness:
+    if the check gave up after one look it could never tell 'late' from 'never'.
+    """
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    calls = {"n": 0}
+    empty = sitemap_xml(site, "some-older-post")
+    listed = sitemap_xml(site, "ready")
+
+    class _Sitemap:
+        """Answers without the post twice, then with it — build-feed finishing late."""
+        def __init__(self):
+            self.status = 200
+
+        def read(self):
+            calls["n"] += 1
+            return (listed if calls["n"] > 2 else empty).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_web[f"{site}/sitemap.xml"] = 200  # declare the route so it is not a 404
+    real_urlopen = srv.urllib.request.urlopen
+
+    def _urlopen(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        if url == f"{site}/sitemap.xml":
+            return _Sitemap()
+        return real_urlopen(req, timeout)
+
+    srv.urllib.request.urlopen = _urlopen
+    try:
+        result = srv.publish_post("ready", for_real=True)
+    finally:
+        srv.urllib.request.urlopen = real_urlopen
+
+    assert result["ok"] is True
+    assert calls["n"] > 2, "the check must poll rather than look once"
+    assert "warnings" not in result, f"sitemap caught up; nothing to warn about: {result.get('warnings')}"
+
+
+def test_sitemap_unreachable_is_reported_not_swallowed(blog, blog_remote, corpus, site, srv, fake_web):
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = 503
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    result = srv.publish_post("ready", for_real=True)
+
+    live = next(s for s in result["trace"] if s["step"] == "wait_for_live")
+    assert result["ok"] is True
+    assert live["sitemap_listed"] is False
+    assert live["sitemap_status"] == 503
