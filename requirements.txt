@@ -1,5 +1,11 @@
+# Runtime only. Upper bounds are deliberate: a green build today says nothing about
+# a breaking major release next month, and an unpinned dep turns that into a mystery
+# failure on an unrelated commit.
 mcp[cli]>=1.27,<2
-anthropic
-beautifulsoup4
-lxml
+anthropic>=0.40,<2
 
+# beautifulsoup4 and lxml were removed on 2026-08-29: nothing in this repo imports
+# them. server.py parses metadata with `re` on purpose (the regexes carry their own
+# reasoning in the docstrings), so the HTML stack was left over from an earlier
+# approach. An unused dependency is install time, supply-chain surface, and a false
+# signal about what the project does.
