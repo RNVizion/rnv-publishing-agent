@@ -1,10 +1,48 @@
 # rnv-publishing (MCP)
 
+[![CI](https://github.com/RNVizion/rnv-publishing-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/RNVizion/rnv-publishing-agent/actions/workflows/ci.yml)
+
 A publishing agent for [rnvizion.dev](https://rnvizion.dev). One instruction ships a blog post end to end: it validates the post, commits and pushes, waits for the page to go live, then refreshes the retrieval assistant that answers questions about the site. The post's index card, RSS feed, and social share image are all rendered separately by CI, so the agent stays light.
 
 A language model decides *whether* to publish. Deterministic tools do the work, in a fixed order, and refuse to ship anything broken.
 
 Built on the Model Context Protocol (FastMCP) and the Anthropic API.
+
+## It refuses
+
+The most important thing this agent does is decline. A post missing a required field does not get published, and nothing downstream runs:
+
+```console
+$ python demo/run_demo.py
+
+── Act 1: It refuses — a post that is not ready does not get published
+  publish_post('half-written', for_real=True)
+  {
+    "slug": "half-written",
+    "ok": false,
+    "stopped_at": "validate_post",
+    "trace": [
+      {
+        "step": "validate_post",
+        "slug": "half-written",
+        "ok": false,
+        "missing_required": [
+          "<article> block",
+          "article:published_time"
+        ],
+        "missing_recommended": [
+          "og:description",
+          "card:summary",
+          "article:author",
+          "og:image"
+        ]
+      }
+    ]
+  }
+  PASS stopped at validation; nothing committed
+```
+
+One step in the trace. No commit, no push, no corpus write, and an exact account of what was wrong. An agent that refuses is worth more than an agent that is usually right.
 
 ---
 
@@ -74,15 +112,35 @@ The agent edits the **site** repo directly and pushes natively. The heavier work
 - **The index, feed, and share image.** On the push, two Actions in the site repo regenerate the blog index and RSS feed from the posts (`build-feed`) and render the per-post Open Graph image (`build-og`), each committing its output back. Image rendering, font handling, and HTML generation never touch the publishing environment.
 - **The RAG rebuild.** `update_corpus` commits a one-line source change to the corpus repo, and a GitHub Action there re-ingests and pushes the vector store to a Hugging Face Space. The heavy ML dependencies and the Hugging Face token stay in CI, never in the publishing environment.
 
+```mermaid
+flowchart TD
+    U([plain-language request]) --> M{{"model: publish or not,<br/>for real or dry run"}}
+    M -->|one decision| P[publish_post]
+
+    P --> V[validate_post]
+    V -->|ok false| STOP(["stop · nothing written"]):::halt
+    V -->|dry run| DRY(["validated only · nothing written"]):::halt
+    V -->|ok| C[commit_and_push]
+    C -->|ok false| STOP
+    C -->|ok| W[wait_for_live]
+    W -->|page not 200| STOP
+    W -->|page live| UC[update_corpus]
+    UC -->|ok false| STOP
+    UC --> DONE([published]):::done
+
+    W -.->|"og:image missing"| WARN[/"warning · does not stop the chain"/]:::warn
+    WARN -.-> UC
+
+    C ==>|push| GHA["site Actions:<br/>build-feed · build-og"]:::ci
+    UC ==>|push| CGHA["corpus Action:<br/>re-ingest to HF Space"]:::ci
+
+    classDef halt fill:#fdeceb,stroke:#a03f38,color:#5c1e1a
+    classDef done fill:#e6f2e9,stroke:#3a7048,color:#1d3a24
+    classDef warn fill:#fdf3dd,stroke:#8a6410,color:#4a3608
+    classDef ci fill:#eeeaf6,stroke:#5b4a86,color:#2c2145
 ```
-agent.py  ──drives──►  server.py (FastMCP: 6 tools)
-                            │
-        ┌───────────────────┼────────────────────┐
-   site repo            live site (poll)     corpus repo
-   (Pages)                                   → Action → HF Space
-      │
-      └─ on push → build-feed (index + feed) + build-og (OG image), committed back
-```
+
+Every solid edge is deterministic code. The only model decision is the diamond at the top. The dotted path is the one deliberate leniency: a missing share image warns and continues, because the image is CI's timing problem rather than the post's defect.
 
 ## Setup
 
@@ -95,13 +153,48 @@ Environment:
 
 Dependencies: the Anthropic SDK and the MCP SDK. Install with `pip install -r requirements.txt`. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
 
+## Try it without touching anything of mine
+
+```bash
+pip install -r requirements.txt
+python demo/run_demo.py
+```
+
+No API key, no credentials, no network. The script builds two git repositories and their bare remotes in a temp directory, serves them over a local HTTP server, and runs **the real chain** against them — real commits, real pushes, real liveness polling. Only the destination is disposable; the code path is the one that runs in production.
+
+It walks five acts and asserts each one:
+
+| Act | Shows |
+| --- | --- |
+| 1 | A draft is refused at validation; nothing is committed |
+| 2 | `for_real` defaults to false; a default call writes nothing |
+| 3 | A real publish runs all four steps — and warns about a share image CI has not rendered yet |
+| 3b | The same publish when CI finishes in time: the poll catches the image, no warning |
+| 4 | Running it again is idempotent — nothing to commit, source already registered |
+
+`--keep` leaves the workspace on disk if you want to inspect the repos afterwards.
+
+## Tests
+
+```bash
+pip install pytest && python -m pytest tests -q
+```
+
+The suite runs against real git repositories with real bare remotes; only the calls to the live site are substituted, and those at the `urllib` boundary rather than inside the tools. What it pins:
+
+- **`tests/test_refusal.py`** — the claims this project makes about itself. A missing required field halts the chain and writes nothing; `for_real` defaults to false; a dry run leaves `git log` untouched. If these fail, the project has stopped doing the thing it says it does.
+- **`tests/test_chain.py`** — the full sequence in order, the commit actually landing in the remote, the corpus write, idempotency on a second run, and the two-speed liveness check: the page is a gate, the share image is advisory.
+- **`tests/test_parsing.py`** — the edge cases the docstrings claim to handle. Apostrophes inside meta content, single-quoted attributes, and metadata inside an HTML comment not counting as present.
+
+CI runs the suite on Python 3.11 and 3.12, then runs the end-to-end demo as a separate job — because "try it yourself" is a claim about someone else's machine, and the only honest way to make it is to have a machine that is not mine run it on every push.
+
 ## What this demonstrates
 
 For anyone reading this as work rather than docs:
 
 - **Agentic design that's safe by construction.** The model holds one decision; the pipeline is deterministic code. Failures are typed and stop the chain, not silent.
 - **MCP as a tool layer.** A clean FastMCP server with small, single-purpose, idempotent tools that compose.
-- **Integrity gating.** "Refuse to ship broken" is enforced in code, at three points, not left to a prompt.
+- **Integrity gating.** "Refuse to ship broken" is enforced in code, at three points, not left to a prompt — and checked by a test suite rather than asserted here.
 - **The right work in the right place.** Index and feed generation, image rendering, and ML rebuilds all run in CI; the agent stays a light, legible orchestrator. The division is the design.
 - **Real automation on a real system.** It extends an existing static site, feed, and retrieval assistant; it isn't a toy built to demo the pattern.
 
