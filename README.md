@@ -61,7 +61,7 @@ The orchestration itself is code, not a prompt. `publish_post` runs the chain in
 
 1. `validate_post` — checks the post carries everything the feed needs; **stops the publish if a required field is missing**
 2. `commit_and_push` — stages and commits the post, then pushes
-3. `wait_for_live` — polls the live URL until it returns 200, so nothing downstream runs against a page that hasn't deployed; then confirms the post's `og:image` is reachable and flags it if not
+3. `wait_for_live` — polls the live URL until it returns 200, so nothing downstream runs against a page that hasn't deployed; then confirms the site itself caught up, by checking that the sitemap lists the post and that the `og:image` is reachable, flagging either if not
 4. `update_corpus` — registers the post with the RAG corpus and triggers a rebuild
 
 A **dry run** (`for_real=false`, the default) runs step 1 and stops, writing and pushing nothing. It confirms the post clears the required-field bar before any real publish.
@@ -78,7 +78,9 @@ The agent would rather publish nothing than publish something half-built.
 
 Each tool returns `{ ok, ... }`, so the chain reasons about success structurally instead of parsing prose.
 
-One check is deliberately softer than the rest. `wait_for_live` also confirms the post's social image is live, but that's a **warning, not a gate**: the image is rendered by the `build-og` Action a beat after the push, so a slow CI run shouldn't fail an otherwise-good publish. A missing image surfaces in the result as a warning; the post still publishes and the corpus still ingests. It's the one place where blocking would punish the post for CI's timing rather than for being broken.
+**A live page proves less than it looks like it proves.** The deploy lands in two waves: this push puts the post's own file live, then the `build-feed` Action commits the blog index, the feed, and the sitemap, which go live a beat later. A 200 on the post URL only ever proved the first wave. In between, the post loads fine while the index and sitemap don't know it exists, so anything reading the site as a whole — a preview scraper, a crawler, a reader landing on the blog index — sees a half-updated site. Checking the page is checking that the front door opened; checking the sitemap is checking that the lights came on too. The sitemap only lists the post once `build-feed` has regenerated it, so finding the post there is proof the whole sequence ran.
+
+Two checks are deliberately softer than the rest. `wait_for_live` also confirms the post's social image is live, but that's a **warning, not a gate**: the image is rendered by the `build-og` Action a beat after the push, so a slow CI run shouldn't fail an otherwise-good publish. A missing image surfaces in the result as a warning; the post still publishes and the corpus still ingests. It's the one place where blocking would punish the post for CI's timing rather than for being broken.
 
 ## The tools
 
@@ -87,7 +89,7 @@ One check is deliberately softer than the rest. `wait_for_live` also confirms th
 | `list_posts` | Enumerate published posts with slug, title, date |
 | `validate_post` | Gate: required vs. recommended fields |
 | `commit_and_push` | Stage and commit the post, push |
-| `wait_for_live` | Poll until the page serves 200, then confirm the `og:image` (warn-only) |
+| `wait_for_live` | Poll until the page serves 200, then confirm the sitemap lists it and the `og:image` renders (both warn-only) |
 | `update_corpus` | Register the post and trigger a RAG rebuild |
 | `publish_post` | Run the whole chain, stopping at the first failure |
 
@@ -128,7 +130,7 @@ flowchart TD
     UC -->|ok false| STOP
     UC --> DONE([published]):::done
 
-    W -.->|"og:image missing"| WARN[/"warning · does not stop the chain"/]:::warn
+    W -.->|"sitemap or og:image lagging"| WARN[/"warning · does not stop the chain"/]:::warn
     WARN -.-> UC
 
     C ==>|push| GHA["site Actions:<br/>build-feed · build-og"]:::ci
@@ -140,7 +142,7 @@ flowchart TD
     classDef ci fill:#eeeaf6,stroke:#5b4a86,color:#2c2145
 ```
 
-Every solid edge is deterministic code. The only model decision is the diamond at the top. The dotted path is the one deliberate leniency: a missing share image warns and continues, because the image is CI's timing problem rather than the post's defect.
+Every solid edge is deterministic code. The only model decision is the diamond at the top. The dotted path is the deliberate leniency: a lagging sitemap or share image warns and continues, because both are the second wave's timing rather than the post's defect.
 
 ## Setup
 
@@ -151,7 +153,7 @@ Environment:
 - `CORPUS_REPO` — path to the corpus checkout (default `/workspaces/rnv-ask-the-corpus`)
 - `SITE_URL` — live origin for `wait_for_live` (default `https://rnvizion.dev`)
 
-Dependencies: the Anthropic SDK and the MCP SDK. Install with `pip install -r requirements.txt`. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
+Dependencies: the Anthropic SDK and the MCP SDK, both with upper bounds. Install with `pip install -r requirements.txt`, or `pip install -r requirements-dev.txt` to also get the test tooling. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
 
 ## Try it without touching anything of mine
 
@@ -168,8 +170,8 @@ It walks five acts and asserts each one:
 | --- | --- |
 | 1 | A draft is refused at validation; nothing is committed |
 | 2 | `for_real` defaults to false; a default call writes nothing |
-| 3 | A real publish runs all four steps — and warns about a share image CI has not rendered yet |
-| 3b | The same publish when CI finishes in time: the poll catches the image, no warning |
+| 3 | A real publish runs all four steps — and warns that neither the sitemap nor the share image has caught up yet |
+| 3b | The same publish when the second-wave jobs finish in time: the polls catch both, no warning |
 | 4 | Running it again is idempotent — nothing to commit, source already registered |
 
 `--keep` leaves the workspace on disk if you want to inspect the repos afterwards.
@@ -177,7 +179,8 @@ It walks five acts and asserts each one:
 ## Tests
 
 ```bash
-pip install pytest && python -m pytest tests -q
+pip install -r requirements-dev.txt
+python -m pytest tests -q
 ```
 
 The suite runs against real git repositories with real bare remotes; only the calls to the live site are substituted, and those at the `urllib` boundary rather than inside the tools. What it pins:
@@ -185,6 +188,9 @@ The suite runs against real git repositories with real bare remotes; only the ca
 - **`tests/test_refusal.py`** — the claims this project makes about itself. A missing required field halts the chain and writes nothing; `for_real` defaults to false; a dry run leaves `git log` untouched. If these fail, the project has stopped doing the thing it says it does.
 - **`tests/test_chain.py`** — the full sequence in order, the commit actually landing in the remote, the corpus write, idempotency on a second run, and the two-speed liveness check: the page is a gate, the share image is advisory.
 - **`tests/test_parsing.py`** — the edge cases the docstrings claim to handle. Apostrophes inside meta content, single-quoted attributes, and metadata inside an HTML comment not counting as present.
+- **`tests/test_mcp_surface.py`** — the protocol layer, over a real stdio transport. Every other test imports `server` and calls its functions directly, which skips registration entirely; a tool accidentally unregistered or renamed would pass all of them and fail here. It also asserts the gate holds when driven through the transport rather than in-process.
+
+A note on how the suite fails. An earlier version of these tests could *hang* on the single most important regression: flipping `publish_post`'s `for_real` default to true made the dry-run test start a real publish and sit in a 180-second poll, which in CI is a stuck runner rather than a red X. The `no_real_network` fixture now blocks any undeclared network call and names the URL, so that regression fails in under three seconds; the workflow's `timeout-minutes` is the backstop for whatever the fixture didn't anticipate.
 
 CI runs the suite on Python 3.11 and 3.12, then runs the end-to-end demo as a separate job — because "try it yourself" is a claim about someone else's machine, and the only honest way to make it is to have a machine that is not mine run it on every push.
 
