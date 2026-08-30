@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client, get_default_environment
@@ -43,8 +44,11 @@ def to_anthropic(mcp_tools):
             for t in mcp_tools.tools]
 
 async def run(request):
+    # Absolute path: the child is spawned with the caller's cwd, so a relative
+    # "server.py" only resolves when the agent happens to be run from the repo root.
+    server_path = str(Path(__file__).resolve().parent / "server.py")
     params = StdioServerParameters(
-        command=sys.executable, args=["server.py"], env=server_env()
+        command=sys.executable, args=[server_path], env=server_env()
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
