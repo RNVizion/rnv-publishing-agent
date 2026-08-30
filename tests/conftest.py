@@ -126,19 +126,63 @@ def srv():
     return server
 
 
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch):
+    """Fail fast on an undeclared network call, and never sleep on a real clock.
+
+    This exists because of a regression that should have gone red and instead went
+    quiet. Flipping publish_post's `for_real` default from False to True — precisely
+    the mistake the gate is there to catch — did not fail the suite; it *hung*, because
+    the dry-run test suddenly ran a real publish and sat in wait_for_live's 180-second
+    poll. In CI with no job timeout that is a stuck runner and a six-hour wait instead
+    of a red X.
+
+    A timeout in the workflow caps the damage. This makes the damage a test failure
+    instead: any tool that reaches the network in a test that did not ask for
+    `fake_web` raises immediately, naming the URL, so the regression reports itself
+    as what it is. The clock is faked for every test, so no poll can burn wall time
+    even when a test does opt in.
+    """
+    import server as srv_mod
+
+    clock = {"t": 0.0}
+
+    def _sleep(seconds):
+        clock["t"] += max(float(seconds), 1.0)
+
+    def _blocked(req, timeout=None):
+        url = req if isinstance(req, str) else getattr(req, "full_url", req)
+        raise AssertionError(
+            f"undeclared network call to {url}. A test that expects the chain to "
+            f"reach the network must request the `fake_web` fixture and route the "
+            f"URL. If you did not expect a network call here, the code under test "
+            f"just did something it should not have."
+        )
+
+    monkeypatch.setattr(srv_mod.time, "sleep", _sleep)
+    monkeypatch.setattr(srv_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(srv_mod.urllib.request, "urlopen", _blocked)
+    return clock
+
+
 @pytest.fixture
 def fake_web(monkeypatch, srv):
     """Substitute the network at the urllib boundary.
 
-    `routes` maps a URL to an int status or an Exception to raise. Anything not
-    listed 404s, so a test that forgets to declare a URL fails loudly rather than
-    silently passing against the real internet.
+    `routes` maps a URL to an int status, a (status, body) tuple for endpoints whose
+    body is read (the sitemap), or an Exception to raise. Anything not listed 404s,
+    so a test that forgets to declare a URL fails loudly rather than silently passing
+    against the real internet.
     """
     routes: dict[str, object] = {}
 
     class _Resp:
-        def __init__(self, status):
+        def __init__(self, status, body=""):
             self.status = status
+            self._body = body
+
+        def read(self):
+            return self._body.encode("utf-8")
 
         def __enter__(self):
             return self
@@ -151,20 +195,20 @@ def fake_web(monkeypatch, srv):
         outcome = routes.get(url, 404)
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, tuple):
+            return _Resp(outcome[0], outcome[1])
         return _Resp(outcome)
 
-    # A fake clock, so a poll that is supposed to time out does so instantly instead
-    # of spinning for its real 180 seconds. sleep advances the clock; monotonic reads
-    # it. Without this, no-op sleep turns every timeout path into a busy loop.
-    clock = {"t": 0.0}
-
-    def _sleep(seconds):
-        clock["t"] += max(float(seconds), 1.0)
-
+    # The clock is already faked for every test by no_real_network; this fixture
+    # only opts the test in to reaching the (substituted) network.
     monkeypatch.setattr(srv.urllib.request, "urlopen", _urlopen)
-    monkeypatch.setattr(srv.time, "sleep", _sleep)
-    monkeypatch.setattr(srv.time, "monotonic", lambda: clock["t"])
     return routes
+
+
+def sitemap_xml(site: str, *slugs: str) -> str:
+    """A minimal sitemap listing the given slugs, in the shape build-feed emits."""
+    urls = "".join(f"<url><loc>{site}/blog/{s}/</loc></url>" for s in slugs)
+    return f'<?xml version="1.0" encoding="UTF-8"?><urlset>{urls}</urlset>'
 
 
 def git_log(repo: Path) -> list[str]:
