@@ -11,9 +11,21 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("rnv-publishing")
 
-BLOG_REPO = Path(os.environ.get("BLOG_REPO", "/workspaces/rnvizion.github.io"))
-SITE_URL = os.environ.get("SITE_URL", "https://rnvizion.dev")
-CORPUS_REPO = Path(os.environ.get("CORPUS_REPO", "/workspaces/rnv-ask-the-corpus"))
+# Config is resolved per call, not at import. Reading these into module constants
+# meant a test or a demo run could not point the server anywhere without reimporting
+# it, and the Codespace default silently won whenever the env var arrived late.
+DEFAULT_BLOG_REPO = "/workspaces/rnvizion.github.io"
+DEFAULT_CORPUS_REPO = "/workspaces/rnv-ask-the-corpus"
+DEFAULT_SITE_URL = "https://rnvizion.dev"
+
+def blog_repo() -> Path:
+    return Path(os.environ.get("BLOG_REPO", DEFAULT_BLOG_REPO))
+
+def corpus_repo() -> Path:
+    return Path(os.environ.get("CORPUS_REPO", DEFAULT_CORPUS_REPO))
+
+def site_url() -> str:
+    return os.environ.get("SITE_URL", DEFAULT_SITE_URL).rstrip("/")
 
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
@@ -29,12 +41,12 @@ def _meta(html: str, attr: str, value: str) -> str:
 
 def _git(*args):
     """Run a git command inside the blog repo; returns the CompletedProcess."""
-    return subprocess.run(["git", *args], cwd=BLOG_REPO, capture_output=True, text=True)
+    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True)
 
 @mcp.tool()
 def list_posts() -> list[dict]:
     """List every published post in the blog with its slug, title, and date."""
-    blog_dir = BLOG_REPO / "blog"
+    blog_dir = blog_repo() / "blog"
     if not blog_dir.exists():
         raise ValueError(f"blog dir not found at {blog_dir} — set BLOG_REPO to your blog repo path")
     posts = []
@@ -50,7 +62,7 @@ def list_posts() -> list[dict]:
 def validate_post(slug: str) -> dict:
     """Check a post has everything the feed needs before publishing.
     Returns ok=False with the missing items if anything required is absent."""
-    path = BLOG_REPO / "blog" / slug / "index.html"
+    path = blog_repo() / "blog" / slug / "index.html"
     if not path.exists():
         return {"slug": slug, "ok": False, "error": f"no index.html at blog/{slug}/"}
     body = _strip_comments(path.read_text(encoding="utf-8"))
@@ -144,7 +156,7 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
 
     The image URL is read from the post's own og:image meta, so the check follows
     whatever the post actually claims rather than a hardcoded path."""
-    url = f"{SITE_URL}/blog/{slug}/"
+    url = f"{site_url()}/blog/{slug}/"
     deadline = time.monotonic() + timeout
     last = None
     while True:
@@ -160,12 +172,12 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
         if time.monotonic() >= deadline:
             return {"slug": slug, "ok": False, "live": False, "url": url,
                     "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
-        time.sleep(interval)
+        time.sleep(max(interval, 1))
 
     result = {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
 
     # Page is live. Now confirm the og:image the post declares is reachable.
-    post_path = BLOG_REPO / "blog" / slug / "index.html"
+    post_path = blog_repo() / "blog" / slug / "index.html"
     og_image = ""
     if post_path.exists():
         og_image = _meta(_strip_comments(post_path.read_text(encoding="utf-8")),
@@ -192,7 +204,7 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                 f"the build-og Action may still be running, or failed to render {og_image}"
             )
             return result
-        time.sleep(interval)
+        time.sleep(max(interval, 1))
 
 @mcp.tool()
 def update_corpus(slug: str, dry_run: bool = False) -> dict:
@@ -204,7 +216,7 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     does the actual re-ingest and Hugging Face Space push on that push, so this tool
     stays light and never imports the ML stack.
     dry_run=True reports what it would add without writing or pushing."""
-    url = f"{SITE_URL}/blog/{slug}/"
+    url = f"{site_url()}/blog/{slug}/"
 
     # Refuse to register a source that isn't live (no broken sources).
     try:
@@ -216,7 +228,7 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
         return {"slug": slug, "ok": False,
                 "error": f"{url} not reachable ({e}); run wait_for_live first"}
 
-    sources_path = CORPUS_REPO / "sources.json"
+    sources_path = corpus_repo() / "sources.json"
     if not sources_path.exists():
         return {"slug": slug, "ok": False,
                 "error": f"sources.json not found at {sources_path} — set CORPUS_REPO to your ask-the-corpus checkout"}
@@ -233,7 +245,7 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     sources_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     def _cgit(*args):
-        return subprocess.run(["git", *args], cwd=CORPUS_REPO, capture_output=True, text=True)
+        return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True, text=True)
 
     add = _cgit("add", "--", "sources.json")
     if add.returncode != 0:
@@ -249,7 +261,8 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
             "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
 
 @mcp.tool()
-def publish_post(slug: str, for_real: bool = False) -> dict:
+def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
+                 interval: int = 10, og_timeout: int = 90) -> dict:
     """Run the publish chain for a post in one deterministic sequence and stop at
     the first failure, returning the full trace.
 
@@ -264,7 +277,11 @@ def publish_post(slug: str, for_real: bool = False) -> dict:
 
     A live-but-imageless share card is a warning, not a failure: the post still
     publishes and the corpus still ingests, but `warnings` carries the og:image
-    notice so it never slips by unseen."""
+    notice so it never slips by unseen.
+
+    timeout, interval and og_timeout are forwarded to wait_for_live. The defaults are
+    tuned for a real GitHub Pages deploy; they exist as parameters so a test or a
+    demo can exercise the whole chain without waiting three minutes on a poll."""
     trace = []
     warnings = []
 
@@ -287,7 +304,8 @@ def publish_post(slug: str, for_real: bool = False) -> dict:
     if not cp.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "commit_and_push", "trace": trace}
 
-    live = step("wait_for_live", wait_for_live(slug))
+    live = step("wait_for_live", wait_for_live(slug, timeout=timeout, interval=interval,
+                                               og_timeout=og_timeout))
     if not live.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "wait_for_live", "trace": trace}
     if live.get("og_image_live") is False:
