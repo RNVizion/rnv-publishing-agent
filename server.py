@@ -125,6 +125,20 @@ def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict
     return {"slug": slug, "ok": True, "committed": True, "pushed": True,
             "message": msg, "files": pending}
 
+def _fetch_text(url: str, timeout: int = 15):
+    """GET a URL; return (status, body_text). Status is the error string if
+    unreachable, and the body is '' whenever there is nothing to read."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            raw = r.read()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            return r.status, raw
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception as e:  # connection errors, timeouts, DNS, etc.
+        return str(e), ""
+
 def _head_status(url: str, timeout: int = 15):
     """HEAD a URL; return the HTTP status code, or the error string if unreachable."""
     try:
@@ -138,15 +152,30 @@ def _head_status(url: str, timeout: int = 15):
 
 @mcp.tool()
 def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
-                  og_timeout: int = 90) -> dict:
+                  og_timeout: int = 90, sitemap_timeout: int = 60) -> dict:
     """Poll the live post URL until it returns HTTP 200, then confirm the post's
     og:image is live too.
 
     Run after commit_and_push and before re-ingesting, so the RAG never fetches a
     404/403 during the GitHub Pages deploy window.
 
-    Two checks, two roles:
+    Three checks, two roles:
       - The PAGE is the gate. ok=False if it isn't 200 within `timeout` seconds.
+      - The SITEMAP is ADVISORY, and it is the check that says the *site* caught up
+        rather than just the post. The deploy lands in two waves: this push puts the
+        post's own file live (wave one), then the build-feed Action commits the blog
+        index, the feed, and the sitemap, which go live a beat later (wave two). A
+        200 on the post page only ever proved wave one. Between the waves the post
+        loads fine while the index and sitemap do not know it exists, so anything
+        reading the site as a whole — a preview scraper, a crawler, a reader landing
+        on the blog index — sees a half-updated site. The sitemap is the cheapest
+        proof wave two landed, because the post appears in it only after build-feed
+        regenerates it. Advisory for the same reason the image is: a lagging sitemap
+        is another process catching up, not this post being defective. Gate what you
+        are judging; warn about what you are waiting on. (If something downstream
+        ever *reads* the sitemap rather than the post URL, this stops being advisory
+        and becomes a real dependency — move it above update_corpus and return
+        ok=False. Verify the consumer before promoting it.)
       - The og:image is ADVISORY. It's rendered and committed by the build-og
         Action *after* this push, so it legitimately lands a beat later; it gets
         its own `og_timeout` budget starting once the page is live. A missing image
@@ -176,7 +205,31 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
 
     result = {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
 
-    # Page is live. Now confirm the og:image the post declares is reachable.
+    # Page is live: wave one finished. Now find out whether wave two did, by asking
+    # the sitemap whether it has heard of this post yet. Same poll-and-retry shape as
+    # the image check below, pointed at a different target.
+    sitemap_url = f"{site_url()}/sitemap.xml"
+    result["sitemap_url"] = sitemap_url
+    needle = f"/blog/{slug}/"
+    sm_deadline = time.monotonic() + sitemap_timeout
+    sm_status = None
+    while True:
+        sm_status, body = _fetch_text(sitemap_url)
+        if sm_status == 200 and needle in body:
+            result["sitemap_listed"] = True
+            break
+        if time.monotonic() >= sm_deadline:
+            result["sitemap_listed"] = False
+            result["sitemap_status"] = sm_status
+            result["sitemap_warning"] = (
+                f"{sitemap_url} does not list {needle} after {sitemap_timeout}s "
+                f"(last status: {sm_status}); the build-feed Action may still be "
+                f"running, so the blog index and feed may not show this post yet"
+            )
+            break
+        time.sleep(max(interval, 1))
+
+    # Now confirm the og:image the post declares is reachable.
     post_path = blog_repo() / "blog" / slug / "index.html"
     og_image = ""
     if post_path.exists():
@@ -262,7 +315,8 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
 
 @mcp.tool()
 def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
-                 interval: int = 10, og_timeout: int = 90) -> dict:
+                 interval: int = 10, og_timeout: int = 90,
+                 sitemap_timeout: int = 60) -> dict:
     """Run the publish chain for a post in one deterministic sequence and stop at
     the first failure, returning the full trace.
 
@@ -305,9 +359,12 @@ def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
         return {"slug": slug, "ok": False, "stopped_at": "commit_and_push", "trace": trace}
 
     live = step("wait_for_live", wait_for_live(slug, timeout=timeout, interval=interval,
-                                               og_timeout=og_timeout))
+                                               og_timeout=og_timeout,
+                                               sitemap_timeout=sitemap_timeout))
     if not live.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "wait_for_live", "trace": trace}
+    if live.get("sitemap_listed") is False:
+        warnings.append(live.get("sitemap_warning", "sitemap does not list the post yet"))
     if live.get("og_image_live") is False:
         warnings.append(live.get("og_image_warning", "og:image not live yet"))
 
