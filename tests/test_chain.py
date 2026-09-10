@@ -218,3 +218,53 @@ def test_sitemap_unreachable_is_reported_not_swallowed(blog, blog_remote, corpus
     assert result["ok"] is True
     assert live["sitemap_listed"] is False
     assert live["sitemap_status"] == 503
+
+
+def test_og_image_that_catches_up_produces_no_warning(blog, blog_remote, corpus, site, srv, fake_web):
+    """The image poll keeps looking, so a share card that lands in time is not reported late.
+
+    Counterpart to test_lagging_og_image_warns_but_does_not_fail, and the thing that
+    makes the image leniency leniency rather than blindness: a check that gave up
+    after one look could never tell 'late' from 'never'.
+
+    The sitemap has had this counterpart since the two-wave deploy was understood.
+    The image did not, so the claim that the image check keeps looking rested on the
+    sitemap's evidence rather than its own.
+    """
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
+
+    image_url = f"{site}/assets/og/ready.png"
+    calls = {"n": 0}
+
+    class _Image:
+        """404s twice, then 200 — build-og finishing after the page went live."""
+        def __init__(self, status):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_web[image_url] = 404  # declare the route so a missed patch fails loudly
+    real_urlopen = srv.urllib.request.urlopen
+
+    def _urlopen(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        if url == image_url:
+            calls["n"] += 1
+            return _Image(200 if calls["n"] > 2 else 404)
+        return real_urlopen(req, timeout)
+
+    srv.urllib.request.urlopen = _urlopen
+    try:
+        result = srv.publish_post("ready", for_real=True)
+    finally:
+        srv.urllib.request.urlopen = real_urlopen
+
+    assert result["ok"] is True
+    assert calls["n"] > 2, "the image check must poll rather than look once"
+    assert "warnings" not in result, f"image caught up; nothing to warn about: {result.get('warnings')}"
