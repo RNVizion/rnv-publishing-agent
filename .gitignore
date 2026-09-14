@@ -9,3 +9,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# local environment (never commit real values)
+.env
