@@ -182,7 +182,7 @@ Any parent folder works — `~/rnv`, a Desktop folder, `D:/dev`, `/workspaces` i
 cd rnv-publishing-agent
 python -m venv .venv
 source .venv/bin/activate          # Windows / Git Bash: source .venv/Scripts/activate
-pip install -r requirements.txt    # add -r requirements-dev.txt for the test tooling
+pip install -r requirements.txt          # add -r tests/requirements-dev.txt for the test tooling
 ```
 
 ### Configuration — usually none
@@ -242,7 +242,7 @@ It walks five acts and asserts each one:
 ## Tests
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r tests/requirements-dev.txt
 python -m pytest tests -q
 ```
 

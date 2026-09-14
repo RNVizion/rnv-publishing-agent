@@ -34,7 +34,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install -r tests/requirements-dev.txt
 
       # --timeout caps any single test rather than the whole job, so a hang names the
       # test that hung instead of just the job that did.
