@@ -32,6 +32,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Windows consoles default to cp1252, which cannot encode the box-drawing rule and
+# em dash in banner(). Every file this script writes already declares utf-8; stdout
+# was the one stream left to the platform default, so the demo died on its first
+# banner rather than on anything it was testing. Verified on Python 3.13.
+#
+# PYTHONIOENCODING=utf-8 fixes it too, but only for whoever knows to set it. This
+# script's whole claim is "clone it and run it": a first-line traceback with no
+# explanation in the repo reads as a broken demo, which is the one conclusion Act 4
+# exists to prevent. errors="replace" over errors="strict" on purpose — a console
+# that still cannot encode a glyph should print a placeholder, not lose the run.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 BOLD, DIM, GREEN, RED, YELLOW, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m"
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     BOLD = DIM = GREEN = RED = YELLOW = RESET = ""
