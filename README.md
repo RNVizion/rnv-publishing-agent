@@ -182,18 +182,15 @@ Those defaults are Codespace paths. **Off a Codespace, set all three explicitly.
 
 Off a Codespace you also need push access to the site repo, which a Codespace grants natively. Confirm with `git push --dry-run` from the site checkout before publishing for real; without it the chain commits locally and then fails at the push.
 
-A preflight that checks the values rather than an exit code:
+Copy `.env.example` to `.env`, fill it in, and load it in each new shell with `set -a; source .env; set +a` — or export the three from `~/.bashrc`.
+
+Then confirm the machine is actually ready:
 
 ```bash
-python -c "
-import os
-from pathlib import Path
-for k in ('BLOG_REPO','CORPUS_REPO'):
-    v = os.environ.get(k)
-    print(k, '=', v, '| is a dir:', Path(v).is_dir() if v else False)
-print('SITE_URL =', repr(os.environ.get('SITE_URL')))
-"
+python tools/preflight.py --slug <slug>            # add --push-check to test push access
 ```
+
+Preflight is stdlib-only, so it runs before `pip install` and can tell you that is what you still need. It checks interpreter, dependencies, environment, git, and the post's metadata contract, and it reports the *cause* rather than the symptom: an unset `BLOG_REPO` is named as an unset `BLOG_REPO`, not as a missing post. Exit 0 means ready.
 
 Dependencies are the MCP SDK and the Anthropic SDK, both with upper bounds. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
 
