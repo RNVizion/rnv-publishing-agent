@@ -138,9 +138,23 @@ def _meta(html: str, attr: str, value: str) -> str:
     )
     return m.group(2).strip() if m else ""
 
+def _git_env() -> dict:
+    """The environment for a git subprocess, with prompting disabled.
+
+    GIT_TERMINAL_PROMPT=0 turns "ask the user" into an immediate error. Under the MCP
+    transport there is no user to ask and no terminal to ask on, so a prompt is a hang
+    with extra steps. Explicit failure beats silent waiting: the caller can report a
+    credential problem, it cannot report a wait.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def _git(*args):
     """Run a git command inside the blog repo; returns the CompletedProcess."""
-    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True)
+    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, env=_git_env())
 
 @mcp.tool()
 def list_posts() -> list[dict]:
@@ -403,7 +417,8 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     sources_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     def _cgit(*args):
-        return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True, text=True)
+        return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env=_git_env())
 
     add = _cgit("add", "--", "sources.json")
     if add.returncode != 0:
