@@ -22,6 +22,7 @@ import subprocess
 
 import pytest
 
+import rnv_config
 import server
 from conftest import write_post
 
@@ -64,14 +65,21 @@ def test_blog_repo_pointing_at_a_folder_without_blog_is_caught(monkeypatch, tmp_
     assert any("blog/" in p for p in r["problems"])
 
 
-def test_unset_blog_repo_says_it_was_unset(monkeypatch):
-    """The message must name the cause, not just the symptom."""
+def test_an_unresolved_path_reports_where_it_looked(monkeypatch, tmp_path):
+    """The message must name its provenance, not just the path.
+
+    Superseded the older "says it was unset" assertion: with sibling discovery,
+    unset is no longer a cause at all. It is a legitimate source, and the useful
+    diagnosis is WHICH source produced the path that failed.
+    """
     monkeypatch.delenv("BLOG_REPO", raising=False)
+    monkeypatch.setattr(rnv_config, "WORKSPACE_ROOT", tmp_path / "empty-workspace")
     r = server.config_report()
 
     assert r["fatal"] is True
-    assert any("unset" in p for p in r["problems"]), \
-        "an unset variable falling back to a Codespace default must say so"
+    assert any("source:" in p for p in r["problems"]), r["problems"]
+    assert any("sibling" in p for p in r["problems"]), \
+        "it must say it went looking beside the repo"
 
 
 # --- dry run vs real run ---------------------------------------------------
@@ -193,3 +201,112 @@ def test_publish_post_reports_a_bad_blog_repo_as_a_config_stop(blog, site, monke
     assert r["ok"] is False
     assert r["stopped_at"] == "config", "the chain must file this as a config stop"
     assert r["error"] == "config"
+
+
+# --- the resolution chain: environment -> .env -> sibling ------------------
+#
+# Four rungs, tested in the order they are tried. The one that matters most is
+# the first: an explicit variable must beat a discovered sibling, because that is
+# the escape hatch for any layout the sibling rule does not fit, and an escape
+# hatch nothing tests is an escape hatch that quietly stops working.
+
+def test_environment_beats_dotenv_and_sibling(monkeypatch, tmp_path):
+    """Rung 1. The escape hatch. Whatever else is true, an explicit value wins."""
+    wanted = tmp_path / "explicit"
+    (wanted / "blog").mkdir(parents=True)
+    dotenv = tmp_path / "a.env"
+    dotenv.write_text(f'BLOG_REPO="{tmp_path / "from-dotenv"}"\n', encoding="utf-8")
+
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", dotenv)
+    monkeypatch.setenv("BLOG_REPO", str(wanted))
+
+    path, how = rnv_config.resolve_path("BLOG_REPO")
+    assert path == wanted
+    assert how == "environment"
+
+
+def test_dotenv_is_used_when_the_environment_is_silent(monkeypatch, tmp_path):
+    """Rung 2. Per-machine config without a shell ritual in every new terminal."""
+    wanted = tmp_path / "from-dotenv"
+    dotenv = tmp_path / "a.env"
+    dotenv.write_text(f'BLOG_REPO="{wanted}"\n', encoding="utf-8")
+
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", dotenv)
+    monkeypatch.delenv("BLOG_REPO", raising=False)
+
+    path, how = rnv_config.resolve_path("BLOG_REPO")
+    assert path == wanted
+    assert ".env" in how
+
+
+def test_a_sibling_checkout_is_found_with_no_configuration_at_all(monkeypatch, tmp_path):
+    """Rung 3, and the reason a fresh machine needs no setup.
+
+    Whatever folder holds the agent repo also holds the site repo. That is true in
+    a Codespace (/workspaces), on a laptop (~/rnv), and on a Desktop layout. The
+    absolute path differs; the relationship does not.
+    """
+    workspace = tmp_path / "anywhere-at-all"
+    (workspace / "rnvizion.github.io" / "blog").mkdir(parents=True)
+    (workspace / "rnv-ask-the-corpus").mkdir(parents=True)
+
+    monkeypatch.setattr(rnv_config, "WORKSPACE_ROOT", workspace)
+    monkeypatch.delenv("BLOG_REPO", raising=False)
+    monkeypatch.delenv("CORPUS_REPO", raising=False)
+
+    blog, how = rnv_config.resolve_path("BLOG_REPO")
+    corpus, _ = rnv_config.resolve_path("CORPUS_REPO")
+
+    assert blog == workspace / "rnvizion.github.io"
+    assert corpus == workspace / "rnv-ask-the-corpus"
+    assert "sibling" in how
+
+
+def test_a_relative_value_resolves_against_the_agent_repo_not_the_cwd(monkeypatch, tmp_path):
+    """A .env holding `../my-site` must mean the same thing from any directory.
+
+    Same lesson as agent.py resolving server.py from __file__: resolving against
+    the working directory makes a value that works from one folder and nowhere else.
+    """
+    monkeypatch.setattr(rnv_config, "AGENT_ROOT", tmp_path / "agent")
+    monkeypatch.setenv("BLOG_REPO", "../site")
+
+    path, how = rnv_config.resolve_path("BLOG_REPO")
+    assert path == (tmp_path / "site")
+    assert "relative to the agent repo" in how
+
+
+# --- the .env parser -------------------------------------------------------
+
+def test_dotenv_parser_keeps_windows_paths_with_spaces_intact():
+    """The case a naive split would truncate, and the reason values are quoted."""
+    got = rnv_config.parse_dotenv('BLOG_REPO="C:/Users/John Smith/rnv/rnvizion.github.io"\n')
+    assert got["BLOG_REPO"] == "C:/Users/John Smith/rnv/rnvizion.github.io"
+
+
+def test_dotenv_parser_handles_the_shapes_people_actually_write():
+    text = (
+        "# a comment\n"
+        "\n"
+        "export SITE_URL=https://rnvizion.dev   # trailing comment\n"
+        "CORPUS_REPO='/single/quoted'\n"
+        "  BLOG_REPO = /padded/with/spaces \n"
+        "EMPTY=\n"
+        "not a valid line\n"
+    )
+    got = rnv_config.parse_dotenv(text)
+
+    assert got["SITE_URL"] == "https://rnvizion.dev"
+    assert got["CORPUS_REPO"] == "/single/quoted"
+    assert got["BLOG_REPO"] == "/padded/with/spaces"
+    assert "EMPTY" not in got, "an empty value is not a value"
+
+
+def test_config_report_carries_the_resolution_and_its_provenance(blog, corpus, site):
+    """A report that says what failed but not where the value came from is half a
+    diagnosis. Every run carries the full resolution so the next question is
+    already answered."""
+    r = server.config_report()
+
+    assert set(r["resolved"]) == {"BLOG_REPO", "CORPUS_REPO", "SITE_URL"}
+    assert all("from" in v for v in r["resolved"].values())

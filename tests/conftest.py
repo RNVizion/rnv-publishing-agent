@@ -72,6 +72,19 @@ def write_post(blog: Path, slug: str, site: str, complete: bool = True, title: s
     return path
 
 
+@pytest.fixture(autouse=True)
+def isolate_dotenv(monkeypatch, tmp_path):
+    """Point the .env lookup at a path that does not exist, for every test.
+
+    server.py resolves config from environment -> .env -> sibling checkout. Without
+    this, a developer with a real .env beside the repo would run a different suite
+    than CI does, and the fallback-rung tests would assert against their machine
+    instead of the design.
+    """
+    import rnv_config
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", tmp_path / "absent.env")
+
+
 @pytest.fixture
 def site(monkeypatch):
     """A stable fake origin for the live site."""

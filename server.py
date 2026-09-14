@@ -13,19 +13,29 @@ mcp = FastMCP("rnv-publishing")
 
 # Config is resolved per call, not at import. Reading these into module constants
 # meant a test or a demo run could not point the server anywhere without reimporting
-# it, and the Codespace default silently won whenever the env var arrived late.
-DEFAULT_BLOG_REPO = "/workspaces/rnvizion.github.io"
-DEFAULT_CORPUS_REPO = "/workspaces/rnv-ask-the-corpus"
-DEFAULT_SITE_URL = "https://rnvizion.dev"
+# it, and the default silently won whenever the env var arrived late.
+#
+# WHERE the values come from lives in rnv_config.py, shared with tools/preflight.py
+# so there is one definition rather than two that drift. The order is:
+#   environment -> .env beside the repo -> a sibling checkout -> nothing found.
+# The sibling rung is why a fresh machine usually needs no configuration at all: the
+# three repos are cloned next to each other, and that relationship holds on every
+# machine even when the absolute path does not. It retires the hardcoded /workspaces
+# defaults, which were correct only in a Codespace and silently wrong everywhere else.
+from rnv_config import resolve_path, resolve_site_url, describe
+
 
 def blog_repo() -> Path:
-    return Path(os.environ.get("BLOG_REPO", DEFAULT_BLOG_REPO))
+    return resolve_path("BLOG_REPO")[0]
+
 
 def corpus_repo() -> Path:
-    return Path(os.environ.get("CORPUS_REPO", DEFAULT_CORPUS_REPO))
+    return resolve_path("CORPUS_REPO")[0]
+
 
 def site_url() -> str:
-    return os.environ.get("SITE_URL", DEFAULT_SITE_URL).rstrip("/")
+    return resolve_site_url()[0]
+
 
 # ---------------------------------------------------------------------------
 # Configuration errors must never wear a post error's face.
@@ -57,15 +67,20 @@ def site_url() -> str:
 # fixes a lagging CI job, and waiting never fixes a wrong path.
 # ---------------------------------------------------------------------------
 
-def _path_problem(var: str, path: Path, default: str, needs_blog_dir: bool) -> str:
-    """Describe what is wrong with a configured path, or '' if nothing is."""
-    unset = var not in os.environ
-    tail = f" ({var} is unset, so the built-in default {default} was used)" if unset else ""
+def _path_problem(var: str) -> str:
+    """Describe what is wrong with a configured path, or '' if nothing is.
+
+    The message names its provenance, because "BLOG_REPO does not resolve" is only
+    half a diagnosis; the other half is whether that path came from the shell, from
+    .env, or from looking beside the repo. Knowing which one it was is knowing which
+    one to fix.
+    """
+    path, how = resolve_path(var)
     if not path.is_dir():
-        return f"{var} does not resolve to a directory: {path}{tail}"
-    if needs_blog_dir and not (path / "blog").is_dir():
-        return (f"{var} resolves to {path}, which contains no blog/ directory"
-                f"{tail}; it should be the site repo root")
+        return f"{var}: no directory at {path} (source: {how})"
+    if var == "BLOG_REPO" and not (path / "blog").is_dir():
+        return (f"{var}: {path} contains no blog/ directory (source: {how}); "
+                "it should be the site repo root")
     return ""
 
 
@@ -79,14 +94,14 @@ def config_report(for_real: bool = False) -> dict:
     problems: list[str] = []
     warnings: list[str] = []
 
-    blog = _path_problem("BLOG_REPO", blog_repo(), DEFAULT_BLOG_REPO, needs_blog_dir=True)
+    blog = _path_problem("BLOG_REPO")
     if blog:
         problems.append(blog)
 
-    corpus = _path_problem("CORPUS_REPO", corpus_repo(), DEFAULT_CORPUS_REPO, needs_blog_dir=False)
-    url = site_url()
+    corpus = _path_problem("CORPUS_REPO")
+    url, url_how = resolve_site_url()
     site = "" if re.match(r"^https?://[^\s/]+\.[^\s/]+", url) else \
-           f"SITE_URL is not a usable origin: {url!r}"
+           f"SITE_URL is not a usable origin: {url!r} (source: {url_how})"
 
     deferred = [m for m in (corpus, site) if m]
     if for_real:
@@ -107,7 +122,8 @@ def config_report(for_real: bool = False) -> dict:
     # post problem it did not actually prevent us from seeing.
     return {"ok": not problems, "fatal": bool(blog) or (for_real and bool(deferred)),
             "blog_fatal": bool(blog),
-            "problems": problems, "warnings": warnings}
+            "problems": problems, "warnings": warnings,
+            "resolved": describe()}
 
 
 def _strip_comments(html: str) -> str:

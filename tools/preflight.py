@@ -43,13 +43,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Mirror server.py's fallbacks. If these drift, preflight lies about what the
-# chain would actually do, so they are asserted against server.py below.
-FALLBACKS = {
-    "BLOG_REPO": "/workspaces/rnvizion.github.io",
-    "CORPUS_REPO": "/workspaces/rnv-ask-the-corpus",
-    "SITE_URL": "https://rnvizion.dev",
-}
+# Resolution comes from the module server.py uses, so the two cannot disagree.
+# An earlier draft kept a copy of the defaults here plus a guard warning when the
+# two drifted; a guard against drift is a confession that there are two
+# definitions. rnv_config is stdlib-only, so importing it does not cost this
+# script its run-before-pip-install property.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import rnv_config  # noqa: E402
 
 OK, WARN, BAD = "  ok  ", " warn ", " FAIL "
 problems: list[str] = []
@@ -119,61 +119,45 @@ def check_dependencies() -> None:
         line(OK, "anthropic importable", "(only needed by agent.py)")
 
 
-def check_fallbacks_still_match(repo_root: Path) -> None:
-    """If server.py's fallbacks drift from this file, preflight starts lying."""
+def check_agent_repo(repo_root: Path) -> None:
     server = repo_root / "server.py"
     if not server.is_file():
         fail("server.py not found", f"looked in {repo_root}",
-             "run this from the agent repo root, not the site checkout")
-        return
-    text = server.read_text(encoding="utf-8", errors="replace")
-    drifted = [k for k, v in FALLBACKS.items() if v not in text]
-    if drifted:
-        warn("fallback values may have drifted from server.py",
-             ", ".join(drifted),
-             "update FALLBACKS in tools/preflight.py so this check stays truthful")
+             "run this from the agent repo, not the site checkout")
     else:
-        line(OK, "server.py found; fallback values match")
+        line(OK, "agent repo located", str(repo_root))
 
 
 def check_environment() -> dict[str, Path | None]:
+    """Report what the chain will actually resolve, and from which rung.
+
+    Resolution is environment -> .env -> sibling checkout. The sibling rung means
+    a machine with the repos cloned next to each other needs no configuration, so
+    an unset variable is not itself a problem; a path that does not exist is.
+    """
     print("\nEnvironment")
     resolved: dict[str, Path | None] = {}
 
     for key in ("BLOG_REPO", "CORPUS_REPO"):
-        raw = os.environ.get(key)
-        using_fallback = raw is None
-        value = raw or FALLBACKS[key]
-        path = Path(value)
-
+        path, how = rnv_config.resolve_path(key)
         if path.is_dir():
-            if using_fallback:
-                warn(key, f"unset; using fallback {value} (exists)",
-                     "fine in a Codespace; set it explicitly elsewhere")
-            else:
-                line(OK, key, f"= {value}")
+            line(OK, key, f"= {path}   [{how}]")
             resolved[key] = path
         else:
             resolved[key] = None
-            if using_fallback:
-                fail(key,
-                     f"unset, so it falls back to {value}, which does not exist",
-                     f'export {key}="C:/Users/<you>/rnv/{Path(value).name}"   '
-                     "(Windows: use C:/ form, not /c/)")
-            else:
-                fail(key, f"= {value}  but that directory does not exist",
-                     "check the path; on Windows use C:/Users/... not /c/Users/...")
+            fail(key, f"no directory at {path}   [{how}]",
+                 f'clone {rnv_config.SIBLING[key]} beside the agent repo, '
+                 f'or set {key} explicitly (Windows: C:/ form, not /c/)')
 
-    raw_url = os.environ.get("SITE_URL")
-    url = raw_url or FALLBACKS["SITE_URL"]
+    url, how = rnv_config.resolve_site_url()
     if not re.match(r"^https?://[^\s/]+\.[^\s/]+", url):
-        fail("SITE_URL", f"= {url!r} does not look like a full origin",
+        fail("SITE_URL", f"= {url!r} is not a usable origin   [{how}]",
              'export SITE_URL="https://rnvizion.dev"')
-    elif url.endswith("/"):
-        warn("SITE_URL", f"= {url} has a trailing slash",
-             "wait_for_live joins paths; a trailing slash can double it")
     else:
-        line(OK, "SITE_URL", f"= {url}" + ("  (fallback)" if raw_url is None else ""))
+        line(OK, "SITE_URL", f"= {url}   [{how}]")
+
+    if rnv_config.DOTENV_PATH.is_file():
+        line(OK, ".env present", str(rnv_config.DOTENV_PATH))
 
     return resolved
 
@@ -291,7 +275,7 @@ def main() -> int:
 
     check_interpreter()
     check_dependencies()
-    check_fallbacks_still_match(repo_root)
+    check_agent_repo(repo_root)
     paths = check_environment()
     check_git(paths, args.push_check)
     if args.slug:
