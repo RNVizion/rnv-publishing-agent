@@ -27,6 +27,89 @@ def corpus_repo() -> Path:
 def site_url() -> str:
     return os.environ.get("SITE_URL", DEFAULT_SITE_URL).rstrip("/")
 
+# ---------------------------------------------------------------------------
+# Configuration errors must never wear a post error's face.
+#
+# The chain resolves three paths from the environment and falls back to Codespace
+# defaults. Off a Codespace those defaults do not exist, and the failure used to
+# surface late and misattributed: an unset BLOG_REPO made validate_post report
+# "no index.html for <slug>" about a post sitting right there on disk. The tool
+# blamed the post for a defect in the configuration, and a wrong assertion is
+# worse than an absent one because it is trusted.
+#
+# Two rules follow, and they are not the same rule:
+#
+#   1. WHAT IS FATAL depends on whether the run can honestly do its job without
+#      it. BLOG_REPO is fatal in both modes, because validation reads from it and
+#      a dry run that cannot read anything has validated nothing; reporting ok
+#      there would be a green result that never looked. CORPUS_REPO and SITE_URL
+#      are fatal only for a real run: a dry run genuinely does not need them, so
+#      it completes and carries a warning that the real run would fail.
+#
+#   2. WHEN IT IS CHECKED is the part that matters more. All three are checked
+#      before commit_and_push, not when each stage reaches them. A broken
+#      CORPUS_REPO used to fail at stage 5 — after the commit, after the push,
+#      after the post was live — leaving a published post and a failed-looking
+#      trace. A run that is knowably doomed must never take the irreversible
+#      step. Principle 7, applied to configuration rather than intent.
+#
+# This is a gate, not an advisory, and the queue/defect test says why: waiting
+# fixes a lagging CI job, and waiting never fixes a wrong path.
+# ---------------------------------------------------------------------------
+
+def _path_problem(var: str, path: Path, default: str, needs_blog_dir: bool) -> str:
+    """Describe what is wrong with a configured path, or '' if nothing is."""
+    unset = var not in os.environ
+    tail = f" ({var} is unset, so the built-in default {default} was used)" if unset else ""
+    if not path.is_dir():
+        return f"{var} does not resolve to a directory: {path}{tail}"
+    if needs_blog_dir and not (path / "blog").is_dir():
+        return (f"{var} resolves to {path}, which contains no blog/ directory"
+                f"{tail}; it should be the site repo root")
+    return ""
+
+
+def config_report(for_real: bool = False) -> dict:
+    """Check every path the chain will need, before the chain needs it.
+
+    Returns {"ok", "fatal", "problems", "warnings"}. `fatal` is True when the run
+    cannot proceed; `problems` always lists everything found, so one call reports
+    every misconfiguration rather than one per round trip.
+    """
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    blog = _path_problem("BLOG_REPO", blog_repo(), DEFAULT_BLOG_REPO, needs_blog_dir=True)
+    if blog:
+        problems.append(blog)
+
+    corpus = _path_problem("CORPUS_REPO", corpus_repo(), DEFAULT_CORPUS_REPO, needs_blog_dir=False)
+    url = site_url()
+    site = "" if re.match(r"^https?://[^\s/]+\.[^\s/]+", url) else \
+           f"SITE_URL is not a usable origin: {url!r}"
+
+    deferred = [m for m in (corpus, site) if m]
+    if for_real:
+        problems.extend(deferred)
+    else:
+        warnings.extend(f"{m} — a dry run does not need it, but a real publish will fail" 
+                        for m in deferred)
+
+    # Two fatalities, deliberately separate, because they are checked at
+    # different points in the chain:
+    #   blog_fatal  - BLOG_REPO. Checked FIRST, before validate_post, because
+    #                 validation reads from it and cannot run without it.
+    #   fatal       - the whole set. Checked before commit_and_push, so a run
+    #                 that will die at stage 5 never takes the irreversible step.
+    # Keeping them separate matters: when BLOG_REPO is fine and only the corpus
+    # path is wrong, validation IS trustworthy, and a half-written post must
+    # still report as a half-written post. A config problem should never mask a
+    # post problem it did not actually prevent us from seeing.
+    return {"ok": not problems, "fatal": bool(blog) or (for_real and bool(deferred)),
+            "blog_fatal": bool(blog),
+            "problems": problems, "warnings": warnings}
+
+
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
 
@@ -46,6 +129,9 @@ def _git(*args):
 @mcp.tool()
 def list_posts() -> list[dict]:
     """List every published post in the blog with its slug, title, and date."""
+    cfg = config_report()
+    if cfg["fatal"]:
+        return {"ok": False, "error": "config", "problems": cfg["problems"]}
     blog_dir = blog_repo() / "blog"
     if not blog_dir.exists():
         raise ValueError(f"blog dir not found at {blog_dir} — set BLOG_REPO to your blog repo path")
@@ -62,6 +148,9 @@ def list_posts() -> list[dict]:
 def validate_post(slug: str) -> dict:
     """Check a post has everything the feed needs before publishing.
     Returns ok=False with the missing items if anything required is absent."""
+    cfg = config_report()
+    if cfg["fatal"]:
+        return {"ok": False, "error": "config", "problems": cfg["problems"]}
     path = blog_repo() / "blog" / slug / "index.html"
     if not path.exists():
         return {"slug": slug, "ok": False, "error": f"no index.html at blog/{slug}/"}
@@ -339,6 +428,19 @@ def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
     trace = []
     warnings = []
 
+    cfg = config_report(for_real=for_real)
+    warnings.extend(cfg["warnings"])
+
+    def config_stop():
+        return {"slug": slug, "ok": False, "stopped_at": "config",
+                "error": "config", "problems": cfg["problems"],
+                "trace": trace + [{"step": "config_report", **cfg}]}
+
+    # Gate one: can we read the post at all? Without BLOG_REPO validation
+    # cannot run, and a dry run that validated nothing must not report ok.
+    if cfg["blog_fatal"]:
+        return config_stop()
+
     def step(name, result):
         entry = {"step": name}
         entry.update(result if isinstance(result, dict) else {"result": result})
@@ -350,9 +452,17 @@ def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
         return {"slug": slug, "ok": False, "stopped_at": "validate_post", "trace": trace}
 
     if not for_real:
-        return {"slug": slug, "ok": True, "dry_run": True,
-                "note": "dry run — validated only; nothing written or pushed. The index, feed, and image build in CI on a real publish.",
-                "trace": trace}
+        out = {"slug": slug, "ok": True, "dry_run": True,
+               "note": "dry run — validated only; nothing written or pushed. The index, feed, and image build in CI on a real publish.",
+               "trace": trace}
+        if warnings:
+            out["warnings"] = warnings
+        return out
+
+    # Gate two: will the REST of the chain work? Checked here, before the one
+    # irreversible step, rather than when stage 5 finally reaches CORPUS_REPO.
+    if cfg["fatal"]:
+        return config_stop()
 
     cp = step("commit_and_push", commit_and_push(slug))
     if not cp.get("ok"):
