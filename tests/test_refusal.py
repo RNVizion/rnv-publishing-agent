@@ -82,3 +82,58 @@ def test_commit_dry_run_reports_without_writing(blog, site, srv):
     assert result["committed"] is False
     assert result["would_commit"] == ["blog/ready/index.html"]
     assert git_log(blog) == before
+
+
+def test_every_subprocess_call_declares_its_stdin():
+    """Every subprocess in server.py must pass stdin explicitly.
+
+    Bought with an incident, 2026-09-14. `capture_output=True` reads as total and is
+    not: it redirects stdout and stderr and says nothing about stdin, which stays
+    INHERITED. Under the MCP stdio transport server.py's stdin is the pipe the client
+    writes JSON-RPC into, so every git call was handed a live transport pipe as its
+    standard input. `git status --porcelain` — a local read — took 278.6 seconds and
+    returned only when the parent process was interrupted.
+
+    Why this is a source check rather than a behavioural one. The failure needs a real
+    stdio transport to appear at all: the direct route has no pipe, so calling
+    publish_post in-process is exactly the configuration that cannot reproduce it, and
+    a test that spawned a transport would be timing-dependent and slow. The property
+    that actually matters is structural and is decidable by reading the file, so read
+    the file. A test asserting "this hangs" would have to wait to find out; this one
+    knows immediately.
+
+    `ast` rather than a regex on purpose: a regex over source cannot tell a call from
+    the string that describes it, and this module's docstrings discuss `subprocess.run`
+    by name. Use and mention, again.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    import server
+
+    source = pathlib.Path(inspect.getfile(server)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"run", "Popen", "call", "check_call", "check_output"}
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+
+    assert calls, "found no subprocess calls in server.py — the check is looking in the wrong place"
+
+    missing = [
+        node.lineno for node in calls
+        if not any(kw.arg == "stdin" for kw in node.keywords)
+    ]
+
+    assert not missing, (
+        f"subprocess call(s) at line(s) {missing} in server.py do not pass stdin. "
+        "capture_output=True does not cover stdin; an inherited stdin under the MCP "
+        "stdio transport is a live pipe and git will block on it indefinitely. "
+        "Pass stdin=subprocess.DEVNULL."
+    )
