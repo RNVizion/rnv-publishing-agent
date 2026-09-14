@@ -268,3 +268,39 @@ def test_og_image_that_catches_up_produces_no_warning(blog, blog_remote, corpus,
     assert result["ok"] is True
     assert calls["n"] > 2, "the image check must poll rather than look once"
     assert "warnings" not in result, f"image caught up; nothing to warn about: {result.get('warnings')}"
+
+
+def test_a_waiting_poll_announces_itself(blog, corpus, site, srv, fake_web, capfd):
+    """A poll that waits says so on stderr, every attempt.
+
+    Bought with an incident, 2026-09-14. publish_post returns one result at the end,
+    so across the three polls here — up to 330 seconds at the default budgets — a
+    correct slow publish and a dead process are byte-identical from outside: both are
+    a blank terminal. That silence was read as a hang. The run was killed four minutes
+    after it had already committed, pushed and gone live, and undoing the publish that
+    had in fact succeeded cost three hours.
+
+    stderr rather than stdout, and this is not a style choice: stdout is the MCP
+    protocol stream and writing to it corrupts the transport. The assertion is
+    deliberately on the presence of the waiting, not on its wording — the lines are
+    for a human watching a terminal, nothing parses them, and a test that pinned the
+    phrasing would make an undeclared protocol out of a diagnostic.
+    """
+    from conftest import sitemap_xml
+
+    write_post(blog, "slow", site)
+    fake_web[f"{site}/blog/slow/"] = 200
+    # Live page, but a sitemap that has not caught up and an image that never
+    # arrives: wave two lagging, which is exactly when the waiting is long.
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site))
+
+    result = srv.wait_for_live("slow", timeout=5, interval=1,
+                               og_timeout=3, sitemap_timeout=3)
+
+    assert result["ok"] is True
+    assert result["sitemap_listed"] is False
+    assert result["og_image_live"] is False
+
+    err = capfd.readouterr().err
+    assert "waiting on the sitemap" in err, "a lagging sitemap poll said nothing"
+    assert "waiting on the share image" in err, "a lagging image poll said nothing"

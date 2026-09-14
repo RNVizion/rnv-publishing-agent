@@ -269,6 +269,35 @@ def _head_status(url: str, timeout: int = 15):
     except Exception as e:  # connection errors, timeouts, DNS, etc.
         return str(e)
 
+def _progress(what: str, elapsed: float, budget: int, detail: str = "") -> None:
+    """Report that a poll is still waiting. Written to stderr, and only to stderr.
+
+    stdout is the MCP protocol stream; writing there corrupts the transport. stderr is
+    forwarded to the caller's terminal by stdio_client (its `errlog` parameter
+    defaults to sys.stderr), and on the direct route it is simply the terminal. So it
+    is the only channel a tool has for saying anything at all before it returns.
+
+    These lines carry no meaning for any caller. The return value is still the entire
+    result and nothing parses this output — which is the point: a progress line that
+    something depends on is an undeclared protocol, and the next person to reword it
+    breaks a consumer nobody knew existed.
+
+    Why it exists. publish_post returns one result at the end, so across the three
+    polls here — up to 330 seconds at the default budgets — a correct slow publish and
+    a dead process are byte-identical from outside: both are a blank terminal. On
+    2026-09-14 that silence was read as a hang and the run was killed four minutes
+    after it had already committed, pushed, and gone live; recovering from the
+    "failure" cost three hours and republished the post four times. The chain was
+    right and unreadable, and unreadable was the expensive half.
+
+    Printed only when about to sleep, never before the first attempt, so a check that
+    succeeds immediately stays silent. Waiting is the thing worth announcing; working
+    is not.
+    """
+    print(f"  ... waiting on {what}: {elapsed:.0f}s of {budget}s{detail}",
+          file=sys.stderr, flush=True)
+
+
 @mcp.tool()
 def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                   og_timeout: int = 90, sitemap_timeout: int = 60) -> dict:
@@ -320,6 +349,8 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
         if time.monotonic() >= deadline:
             return {"slug": slug, "ok": False, "live": False, "url": url,
                     "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
+        _progress("the page", timeout - (deadline - time.monotonic()), timeout,
+                  f" (last status: {last})")
         time.sleep(max(interval, 1))
 
     result = {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
@@ -346,6 +377,8 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                 f"running, so the blog index and feed may not show this post yet"
             )
             break
+        _progress("the sitemap", sitemap_timeout - (sm_deadline - time.monotonic()),
+                  sitemap_timeout, f" (last status: {sm_status})")
         time.sleep(max(interval, 1))
 
     # Now confirm the og:image the post declares is reachable.
@@ -376,6 +409,8 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                 f"the build-og Action may still be running, or failed to render {og_image}"
             )
             return result
+        _progress("the share image", og_timeout - (og_deadline - time.monotonic()),
+                  og_timeout, f" (last status: {og_last})")
         time.sleep(max(interval, 1))
 
 @mcp.tool()
