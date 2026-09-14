@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Fix 2: a poll that can wait minutes must say it is waiting.
+# Fix 3: catch up on the remote before giving up on a push.
 # One commit, verified before it is pushed. Safe to re-run.
 #
-#   bash fix_progress.sh
+#   bash fix_catchup.sh
 #
 set -euo pipefail
 
@@ -24,233 +24,333 @@ python -m pip install -q -r tests/requirements-dev.txt
 python -c "import pytest" 2>/dev/null || bad "pytest not importable after install"
 ok "pytest $(python -c 'import pytest; print(pytest.__version__)')"
 
-# ---------------------------------------------------------------- server.py
-say "patch server.py"
-python - <<'PY'
-import pathlib, sys
+cat > /tmp/_patch_catchup.py <<'PATCHEOF'
+import sys
+from pathlib import Path
+
 
 HELPER_OLD = '''@mcp.tool()
-def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,'''
+def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:'''
 
-HELPER_NEW = '''def _progress(what: str, elapsed: float, budget: int, detail: str = "") -> None:
-    """Report that a poll is still waiting. Written to stderr, and only to stderr.
+HELPER_NEW = '''def _push_with_catchup(run) -> dict:
+    """Push. If the remote has moved, rebase onto it and push again.
 
-    stdout is the MCP protocol stream; writing there corrupts the transport. stderr is
-    forwarded to the caller's terminal by stdio_client (its `errlog` parameter
-    defaults to sys.stderr), and on the direct route it is simply the terminal. So it
-    is the only channel a tool has for saying anything at all before it returns.
+    WHY THIS IS NOT OVER-REACH
+      Both repos this chain writes are written by GitHub Actions too. A publish
+      pushes the post; then build-feed commits the regenerated index, feed, sitemap
+      and robots, and build-og commits the share image, on top of it. So the local
+      clone is behind *after every successful publish*, and the next publish's push
+      is rejected — not because anything is wrong, but because the pipeline did its
+      job. Being behind is the normal resting state here, not an anomaly.
 
-    These lines carry no meaning for any caller. The return value is still the entire
-    result and nothing parses this output — which is the point: a progress line that
-    something depends on is an undeclared protocol, and the next person to reword it
-    breaks a consumer nobody knew existed.
+      Which makes it a queue, not a defect, and the project's own rule applies:
+      gate a defect, warn about a queue. Waiting does not fix this one, but catching
+      up does, and catching up is what a person does without thinking. Refusing
+      instead would fail every publish after the first until someone ran git pull by
+      hand — a gate that fires on the normal case is a gate people learn to skip.
 
-    Why it exists. publish_post returns one result at the end, so across the three
-    polls here — up to 330 seconds at the default budgets — a correct slow publish and
-    a dead process are byte-identical from outside: both are a blank terminal. On
-    2026-09-14 that silence was read as a hang and the run was killed four minutes
-    after it had already committed, pushed, and gone live; recovering from the
-    "failure" cost three hours and republished the post four times. The chain was
-    right and unreadable, and unreadable was the expensive half.
+    WHY IT REACTS RATHER THAN PREDICTS
+      It pushes first and only catches up on an actual rejection, rather than
+      fetching every time to find out whether it needs to. The remote's answer is
+      the fact; a pre-check is a guess about the same fact, one round trip earlier
+      and one race condition wider.
 
-    Printed only when about to sleep, never before the first attempt, so a check that
-    succeeds immediately stays silent. Waiting is the thing worth announcing; working
-    is not.
+    WHY REBASE, NEVER MERGE
+      The local side is one publish commit; the remote side is generated output. A
+      merge would record a fork that never conceptually happened and leave the
+      Actions' commits out of order. Replaying the publish on top keeps the history
+      a straight line that reads the way the work actually happened.
+
+    WHY A CONFLICT ABORTS
+      A conflict means the two sides changed the same lines, which is not a queue and
+      is not fixed by waiting or retrying. It aborts the rebase — restoring the tree,
+      including anything --autostash had set aside — and reports. Half-rebased is the
+      one state worse than not having tried.
+
+    Bought on 2026-09-14: the corpus push was rejected because the rebuild-corpus
+    Action had pushed since the last run. The post was already live by then, so the
+    chain ended with the site published and the corpus not updated — the two out of
+    step, which is the exact half-done state the ordering everywhere else exists to
+    prevent.
     """
-    print(f"  ... waiting on {what}: {elapsed:.0f}s of {budget}s{detail}",
-          file=sys.stderr, flush=True)
+    push = run("push")
+    if push.returncode == 0:
+        return {"ok": True, "caught_up": False}
+
+    err = (push.stderr or "").strip()
+    # Only a non-fast-forward is a catch-up situation. Everything else — no
+    # credentials, no network, a protected branch — is a real failure, and retrying
+    # after a rebase would turn one clear error into two confusing ones.
+    behind = any(s in err for s in ("fetch first", "non-fast-forward", "behind its remote"))
+    if not behind:
+        return {"ok": False, "caught_up": False, "error": err or "git push failed"}
+
+    # Fetch first, and this is not belt-and-braces. A rejected push does NOT update
+    # the remote-tracking ref, so origin/main — which is what @{u} resolves to — still
+    # points where it did before the rejection. Rebasing onto it without fetching
+    # reports "Current branch main is up to date" and changes nothing, after which the
+    # retry is rejected for exactly the same reason: a repair that silently no-ops and
+    # then fails identically, which reads as the fix not working rather than the fix
+    # not having run. Found by running it.
+    fetch = run("fetch", "--quiet", "origin")
+    if fetch.returncode != 0:
+        return {"ok": False, "caught_up": False,
+                "error": f"push was rejected and the remote could not be fetched to catch up: "
+                         f"{(fetch.stderr or '').strip() or 'fetch failed'}"}
+
+    # --autostash because the working tree legitimately carries other changes here:
+    # commit_and_push stages only the post, so a regenerated feed.xml sitting
+    # unstaged is normal and must not block the catch-up or be swept into it.
+    rebase = run("rebase", "--autostash", "@{u}")
+    if rebase.returncode != 0:
+        run("rebase", "--abort")
+        return {"ok": False, "caught_up": False,
+                "error": f"the remote had moved and the catch-up rebase failed, so nothing "
+                         f"was pushed: {(rebase.stderr or '').strip() or 'rebase failed'}"}
+
+    again = run("push")
+    if again.returncode != 0:
+        return {"ok": False, "caught_up": True,
+                "error": (again.stderr or "").strip() or "git push failed after catching up"}
+
+    return {"ok": True, "caught_up": True}
 
 
 @mcp.tool()
-def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,'''
+def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:'''
 
-PAGE_OLD = '''                    "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
-        time.sleep(max(interval, 1))'''
+BLOG_OLD = '''    push = _git("push")
+    if push.returncode != 0:
+        return {"slug": slug, "ok": False, "committed": True, "pushed": False,
+                "error": push.stderr.strip() or "git push failed"}
+    return {"slug": slug, "ok": True, "committed": True, "pushed": True,
+            "message": msg, "files": pending}'''
 
-PAGE_NEW = '''                    "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
-        _progress("the page", timeout - (deadline - time.monotonic()), timeout,
-                  f" (last status: {last})")
-        time.sleep(max(interval, 1))'''
+BLOG_NEW = '''    push = _push_with_catchup(_git)
+    if not push["ok"]:
+        return {"slug": slug, "ok": False, "committed": True, "pushed": False,
+                "error": push["error"]}
+    out = {"slug": slug, "ok": True, "committed": True, "pushed": True,
+           "message": msg, "files": pending}
+    # Present only when it happened, the same way `warnings` is. A field that reads
+    # false on almost every run is noise in a trace a human reads, and its absence
+    # is already the answer.
+    if push["caught_up"]:
+        out["caught_up"] = True
+    return out'''
 
-SITEMAP_OLD = '''                f"running, so the blog index and feed may not show this post yet"
-            )
-            break
-        time.sleep(max(interval, 1))'''
+CORPUS_OLD = '''    push = _cgit("push")
+    if push.returncode != 0:
+        return {"slug": slug, "ok": False, "added": True, "pushed": False,
+                "error": push.stderr.strip() or "git push failed (corpus repo write permission?)"}
+    return {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
+            "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}'''
 
-SITEMAP_NEW = '''                f"running, so the blog index and feed may not show this post yet"
-            )
-            break
-        _progress("the sitemap", sitemap_timeout - (sm_deadline - time.monotonic()),
-                  sitemap_timeout, f" (last status: {sm_status})")
-        time.sleep(max(interval, 1))'''
+CORPUS_NEW = '''    push = _push_with_catchup(_cgit)
+    if not push["ok"]:
+        return {"slug": slug, "ok": False, "added": True, "pushed": False,
+                "error": push["error"] + " (corpus repo write permission?)"}
+    out = {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
+           "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
+    if push["caught_up"]:
+        out["caught_up"] = True
+    return out'''
 
-OG_OLD = '''                f"the build-og Action may still be running, or failed to render {og_image}"
-            )
-            return result
-        time.sleep(max(interval, 1))'''
-
-OG_NEW = '''                f"the build-og Action may still be running, or failed to render {og_image}"
-            )
-            return result
-        _progress("the share image", og_timeout - (og_deadline - time.monotonic()),
-                  og_timeout, f" (last status: {og_last})")
-        time.sleep(max(interval, 1))'''
-
-p = pathlib.Path("server.py")
-s = p.read_text(encoding="utf-8")
-out = s
-
-# Each edit carries a MARKER that exists only in its patched form. "Already applied?"
-# cannot be answered by counting OLD: HELPER_NEW ends with the exact text of
-# HELPER_OLD — it inserts a function *above* the line it anchors on — so OLD is still
-# present after a successful patch, and a count-based check re-applies it on every
-# run. Found by running this script twice and getting two commits.
 EDITS = [
-    (HELPER_OLD,  HELPER_NEW,  "def _progress("),
-    (PAGE_OLD,    PAGE_NEW,    '_progress("the page"'),
-    (SITEMAP_OLD, SITEMAP_NEW, '_progress("the sitemap"'),
-    (OG_OLD,      OG_NEW,      '_progress("the share image"'),
+    (HELPER_OLD, HELPER_NEW, "def _push_with_catchup("),
+    (BLOG_OLD, BLOG_NEW, "_push_with_catchup(_git)"),
+    (CORPUS_OLD, CORPUS_NEW, "_push_with_catchup(_cgit)"),
 ]
 
-for old, new, marker in EDITS:
-    if marker in out:
-        continue
-    n = out.count(old)
-    if n != 1:
-        sys.exit(f"  stop  server.py: expected exactly one match for the anchor before "
-                 f"{marker!r}, found {n} — file has moved, re-fetch")
-    out = out.replace(old, new)
 
-if out == s:
-    print("  skip  server.py already patched")
-else:
+
+
+def main() -> int:
+    undo = "--undo" in sys.argv
+    p = Path("server.py")
+    s = p.read_text(encoding="utf-8")
+    out = s
+    for old, new, marker in EDITS:
+        present = marker in out
+        if (present and not undo) or (not present and undo):
+            continue
+        frm, to = (new, old) if undo else (old, new)
+        n = out.count(frm)
+        if n != 1:
+            sys.exit(f"  stop  server.py: expected exactly one match near {marker!r}, "
+                     f"found {n} — file has moved, re-fetch")
+        out = out.replace(frm, to)
+    if out == s:
+        print("  skip  server.py already in that state")
+        return 0
     p.write_text(out, encoding="utf-8")
-    sites = out.count("_progress(") - out.count("def _progress(")
-    print(f"  ok    server.py patched — _progress called at {sites} poll site(s)")
-PY
+    sites = out.count("_push_with_catchup(") - out.count("def _push_with_catchup(")
+    print(f"  ok    server.py {'reverted' if undo else 'patched'} — "
+          f"_push_with_catchup at {sites} push site(s)")
+    return 0
 
+raise SystemExit(main())
+PATCHEOF
+
+say "patch server.py"
+python /tmp/_patch_catchup.py
 python -c "import ast,pathlib; ast.parse(pathlib.Path('server.py').read_text(encoding='utf-8'))" \
   || bad "server.py no longer parses — do not commit"
 ok "server.py parses"
 
-# ---------------------------------------------------------------- the test
-say "pin it with a test"
-if grep -q "test_a_waiting_poll_announces_itself" tests/test_chain.py; then
-  skip "test already present"
+say "pin it with tests"
+if grep -q "test_a_publish_catches_up_when_a_workflow_has_pushed" tests/test_chain.py; then
+  skip "tests already present"
 else
-  cat >> tests/test_chain.py <<'PYEOF'
+  cat >> tests/test_chain.py <<'TESTEOF'
 
 
-def test_a_waiting_poll_announces_itself(blog, corpus, site, srv, fake_web, capfd):
-    """A poll that waits says so on stderr, every attempt.
+def _a_workflow_pushes(remote, tmp_path, name: str, message: str) -> None:
+    """Commit to the remote from somewhere that is not the chain's clone.
 
-    Bought with an incident, 2026-09-14. publish_post returns one result at the end,
-    so across the three polls here — up to 330 seconds at the default budgets — a
-    correct slow publish and a dead process are byte-identical from outside: both are
-    a blank terminal. That silence was read as a hang. The run was killed four minutes
-    after it had already committed, pushed and gone live, and undoing the publish that
-    had in fact succeeded cost three hours.
+    This is what build-feed and build-og do after every publish: regenerate the
+    index, feed, sitemap and share image, and commit them on top of the post. The
+    local clone is behind from that moment on, which makes being behind the normal
+    resting state between publishes rather than an anomaly.
+    """
+    work = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(remote), str(work)],
+                   check=True, capture_output=True)
+    for key, value in (("user.email", "action@example.invalid"),
+                       ("user.name", "Workflow"),
+                       ("commit.gpgsign", "false")):
+        subprocess.run(["git", "config", key, value], cwd=work,
+                       check=True, capture_output=True)
+    (work / "generated.txt").write_text(message + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=work, check=True, capture_output=True)
 
-    stderr rather than stdout, and this is not a style choice: stdout is the MCP
-    protocol stream and writing to it corrupts the transport. The assertion is
-    deliberately on the presence of the waiting, not on its wording — the lines are
-    for a human watching a terminal, nothing parses them, and a test that pinned the
-    phrasing would make an undeclared protocol out of a diagnostic.
+
+def test_a_publish_catches_up_when_a_workflow_has_pushed(blog, blog_remote, corpus,
+                                                         site, srv, fake_web, tmp_path):
+    """A remote that moved since the last publish does not fail the next one.
+
+    Bought on 2026-09-14. The chain pushed the post, the Actions committed their
+    generated output on top, and the next run's push was rejected as non-fast-forward
+    — correctly, and uselessly. Refusing here would fail every publish after the
+    first until someone ran git pull by hand, and a gate that fires on the normal
+    case is a gate people learn to skip.
     """
     from conftest import sitemap_xml
 
-    write_post(blog, "slow", site)
-    fake_web[f"{site}/blog/slow/"] = 200
-    # Live page, but a sitemap that has not caught up and an image that never
-    # arrives: wave two lagging, which is exactly when the waiting is long.
-    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site))
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
+    fake_web[f"{site}/assets/og/ready.png"] = 200
 
-    result = srv.wait_for_live("slow", timeout=5, interval=1,
-                               og_timeout=3, sitemap_timeout=3)
+    workflow = "chore: rebuild feed, index, sitemap and robots [skip ci]"
+    _a_workflow_pushes(blog_remote, tmp_path, "site-workflow", workflow)
 
-    assert result["ok"] is True
-    assert result["sitemap_listed"] is False
-    assert result["og_image_live"] is False
+    result = srv.publish_post("ready", for_real=True)
 
-    err = capfd.readouterr().err
-    assert "waiting on the sitemap" in err, "a lagging sitemap poll said nothing"
-    assert "waiting on the share image" in err, "a lagging image poll said nothing"
-PYEOF
-  ok "appended to tests/test_chain.py"
+    assert result["ok"] is True, result
+    subjects = _remote_log(blog_remote)
+    assert "Publish: ready" in subjects, "the post never reached the remote"
+    assert workflow in subjects, "the catch-up discarded the workflow's commit"
+    # Newest first: the publish must sit ON TOP of the workflow's commit, replayed
+    # rather than merged beside it.
+    assert subjects.index("Publish: ready") < subjects.index(workflow)
+    assert not any(s.startswith("Merge ") for s in subjects), \
+        "caught up with a merge; the history should stay a straight line"
+
+
+def test_the_corpus_push_catches_up_too(blog, blog_remote, corpus, site, srv,
+                                        fake_web, tmp_path):
+    """The corpus repo has the same shape of writer, so it has the same exposure.
+
+    On 2026-09-14 this was the half that actually broke: the post went live and the
+    corpus write was rejected, leaving the site published and the corpus not — the
+    exact out-of-step state the chain's ordering exists to prevent.
+    """
+    from conftest import sitemap_xml
+
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    rebuild = "corpus: refresh after source change"
+    _a_workflow_pushes(tmp_path / "corpus-remote.git", tmp_path, "corpus-workflow", rebuild)
+
+    result = srv.publish_post("ready", for_real=True)
+
+    assert result["ok"] is True, result
+    corpus_subjects = _remote_log(tmp_path / "corpus-remote.git")
+    assert "corpus: add ready" in corpus_subjects, "the corpus entry never reached the remote"
+    assert rebuild in corpus_subjects, "the catch-up discarded the rebuild commit"
+TESTEOF
+  ok "appended two tests to tests/test_chain.py"
 fi
 
-# ---------------------------------------------------------------- mutation check
-say "mutation check (server.py restored immediately after)"
-cp server.py /tmp/_srv_real.py
-python - <<'PY'
+# Two mutations, because there are two ways to get this wrong and only one of them
+# is "no fix at all". The second is the bug this very script hit in development:
+# the catch-up present but rebasing onto a stale remote-tracking ref, which no-ops
+# and then fails identically.
+say "mutation 1 — no catch-up at all"
+cp server.py /tmp/_srv3.py
+python /tmp/_patch_catchup.py --undo >/dev/null
+M1=$(python -m pytest tests/test_chain.py -q -k "catches_up or catch" 2>&1 || true)
+cp /tmp/_srv3.py server.py
+echo "$M1" | grep -q "2 failed" || bad $'mutation 1 did not fail both tests. pytest said:\n'"$M1"
+ok "both tests fail without the catch-up"
+
+say "mutation 2 — catch-up without the fetch"
+python - <<'MUT'
 import pathlib
-# Line-based, balancing parens: the calls span two lines and contain nested calls
-# and f-string braces, so a regex over the whole text either misses them or eats
-# too much. Counting brackets is the thing that is actually true about the syntax.
-p = pathlib.Path("server.py")
-lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
-out, i, removed = [], 0, 0
-while i < len(lines):
-    if lines[i].lstrip().startswith("_progress("):
-        depth = lines[i].count("(") - lines[i].count(")")
-        i += 1
-        removed += 1
-        while depth > 0 and i < len(lines):
-            depth += lines[i].count("(") - lines[i].count(")")
-            i += 1
-        continue
-    out.append(lines[i])
-    i += 1
-assert removed == 3, f"expected to remove 3 progress calls, removed {removed} — mutation check cannot run"
-p.write_text("".join(out), encoding="utf-8")
-PY
-MUT=$(python -m pytest tests/test_chain.py::test_a_waiting_poll_announces_itself -q 2>&1 || true)
-cp /tmp/_srv_real.py server.py
-rm -f /tmp/_srv_real.py
-echo "$MUT" | grep -q "said nothing" \
-  || bad $'the mutation check did not produce the expected failure. pytest said:\n'"$MUT"
-ok "test fails with the right message when the progress calls are removed"
+p = pathlib.Path("server.py"); s = p.read_text(encoding="utf-8")
+i = s.index('    fetch = run("fetch", "--quiet", "origin")')
+j = s.index('    # --autostash because', i)
+p.write_text(s[:i] + s[j:], encoding="utf-8")
+MUT
+M2=$(python -m pytest tests/test_chain.py -q -k "catches_up or catch" 2>&1 || true)
+cp /tmp/_srv3.py server.py
+rm -f /tmp/_srv3.py /tmp/_patch_catchup.py
+echo "$M2" | grep -q "2 failed" || bad $'mutation 2 did not fail both tests. pytest said:\n'"$M2"
+ok "both tests fail when the catch-up rebases onto a stale ref"
 
 say "full suite"
 python -m pytest -q || bad "suite is red — nothing committed, nothing pushed"
 ok "green"
 
-# ---------------------------------------------------------------- demo still clean
-# Act 4 narrates the demo's stdout. Progress goes to stderr, so stdout must be
-# unchanged — verify rather than assume, since the recording depends on it.
-say "demo: stdout unchanged, stderr now carries the waiting"
-python demo/run_demo.py >/tmp/_d.out 2>/tmp/_d.err || bad "demo failed"
-OUT_LINES=$(wc -l < /tmp/_d.out); ERR_LINES=$(wc -l < /tmp/_d.err)
-grep -cE "^ *PASS" /tmp/_d.out | grep -q "^5$" || bad "expected 5 PASS lines on stdout, demo output changed"
-grep -q "waiting on" /tmp/_d.err || bad "no progress output during the demo's polls"
-ok "stdout $OUT_LINES lines, 5 PASS; stderr $ERR_LINES progress lines"
+say "demo unchanged"
+python demo/run_demo.py >/tmp/_d.out 2>/dev/null || bad "demo failed"
+grep -cE "^ *PASS" /tmp/_d.out | grep -q "^5$" || bad "demo no longer prints 5 PASS lines"
+ok "demo: $(wc -l < /tmp/_d.out) lines of stdout, 5 PASS"
 
-# ---------------------------------------------------------------- commit
-if git diff --quiet -- server.py tests/test_chain.py; then
+if git diff --quiet HEAD -- server.py tests/test_chain.py; then
   skip "already committed"
 else
   git add server.py tests/test_chain.py
-  git commit -q -m "Say that a poll is waiting
+  git commit -q -m "Catch up on the remote before giving up on a push
 
-publish_post returns one result at the end, so across wait_for_live's
-three polls — up to 330 seconds at the default budgets — a correct slow
-publish and a dead process are byte-identical from outside: both are a
-blank terminal.
+Both repos this chain writes are written by GitHub Actions too. A
+publish pushes the post; build-feed then commits the regenerated index,
+feed, sitemap and robots, and build-og the share image, on top of it. So
+the local clone is behind after every successful publish, and the next
+publish's push is rejected — not because anything is wrong, but because
+the pipeline did its job.
 
-That is not hypothetical. On 2026-09-14 the silence was read as a hang
-and the run was killed four minutes after it had already committed,
-pushed and gone live. Undoing a publish that had in fact succeeded cost
-three hours and four republish cycles.
+That makes it a queue rather than a defect, and the project's own rule
+applies: gate a defect, warn about a queue. Refusing would fail every
+publish after the first until someone ran git pull by hand, and a gate
+that fires on the normal case is a gate people learn to skip.
 
-stderr, not stdout: stdout is the MCP protocol stream and writing to it
-corrupts the transport. stdio_client forwards the child's stderr to the
-caller's terminal, and on the direct route it is the terminal. Nothing
-parses these lines and the test asserts only that the waiting is
-announced, not how — a diagnostic something depends on is an undeclared
-protocol.
+On 2026-09-14 it cost a partial success: the post went live and the
+corpus push was rejected, leaving the site published and the corpus not.
 
-Printed only before sleeping, so a check that succeeds immediately stays
-silent. Waiting is worth announcing; working is not.
+It pushes first and reacts to the actual rejection rather than fetching
+every time to predict one. The fetch before the rebase is load-bearing:
+a rejected push does not update the remote-tracking ref, so rebasing
+onto @{u} without it reports 'up to date', changes nothing, and fails
+again identically. Rebase never merge, since the local side is one
+publish and the remote side is generated output. A conflict aborts and
+reports — half-rebased is the one state worse than not having tried.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013Ai6mP1x3Rv5n9ygKQgidt"
