@@ -141,3 +141,19 @@ def describe() -> dict[str, dict[str, str]]:
     url, how = resolve_site_url()
     out["SITE_URL"] = {"value": url, "from": how, "exists": "n/a"}
     return out
+
+
+if __name__ == "__main__":
+    # A library first, and imported by both server.py and tools/preflight.py, so
+    # there is no step in any runbook that "runs rnv_config". But resolution is
+    # load-bearing and was otherwise invisible: the only way to ask what a machine
+    # would resolve, and from which rung, was to run the whole preflight. This is
+    # the smallest possible answer to "where is it actually looking?", and it needs
+    # no dependencies, so it works on a bare interpreter before anything is installed.
+    import json
+    print(f"agent repo    : {AGENT_ROOT}")
+    print(f"sibling search: {WORKSPACE_ROOT}")
+    print(f".env          : {DOTENV_PATH}"
+          f"{'' if DOTENV_PATH.is_file() else '   (not present — fine; siblings are the normal case)'}")
+    print()
+    print(json.dumps(describe(), indent=2))
