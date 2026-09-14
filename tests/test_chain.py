@@ -304,3 +304,84 @@ def test_a_waiting_poll_announces_itself(blog, corpus, site, srv, fake_web, capf
     err = capfd.readouterr().err
     assert "waiting on the sitemap" in err, "a lagging sitemap poll said nothing"
     assert "waiting on the share image" in err, "a lagging image poll said nothing"
+
+
+def _a_workflow_pushes(remote, tmp_path, name: str, message: str) -> None:
+    """Commit to the remote from somewhere that is not the chain's clone.
+
+    This is what build-feed and build-og do after every publish: regenerate the
+    index, feed, sitemap and share image, and commit them on top of the post. The
+    local clone is behind from that moment on, which makes being behind the normal
+    resting state between publishes rather than an anomaly.
+    """
+    work = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(remote), str(work)],
+                   check=True, capture_output=True)
+    for key, value in (("user.email", "action@example.invalid"),
+                       ("user.name", "Workflow"),
+                       ("commit.gpgsign", "false")):
+        subprocess.run(["git", "config", key, value], cwd=work,
+                       check=True, capture_output=True)
+    (work / "generated.txt").write_text(message + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=work, check=True, capture_output=True)
+
+
+def test_a_publish_catches_up_when_a_workflow_has_pushed(blog, blog_remote, corpus,
+                                                         site, srv, fake_web, tmp_path):
+    """A remote that moved since the last publish does not fail the next one.
+
+    Bought on 2026-09-14. The chain pushed the post, the Actions committed their
+    generated output on top, and the next run's push was rejected as non-fast-forward
+    — correctly, and uselessly. Refusing here would fail every publish after the
+    first until someone ran git pull by hand, and a gate that fires on the normal
+    case is a gate people learn to skip.
+    """
+    from conftest import sitemap_xml
+
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    workflow = "chore: rebuild feed, index, sitemap and robots [skip ci]"
+    _a_workflow_pushes(blog_remote, tmp_path, "site-workflow", workflow)
+
+    result = srv.publish_post("ready", for_real=True)
+
+    assert result["ok"] is True, result
+    subjects = _remote_log(blog_remote)
+    assert "Publish: ready" in subjects, "the post never reached the remote"
+    assert workflow in subjects, "the catch-up discarded the workflow's commit"
+    # Newest first: the publish must sit ON TOP of the workflow's commit, replayed
+    # rather than merged beside it.
+    assert subjects.index("Publish: ready") < subjects.index(workflow)
+    assert not any(s.startswith("Merge ") for s in subjects), \
+        "caught up with a merge; the history should stay a straight line"
+
+
+def test_the_corpus_push_catches_up_too(blog, blog_remote, corpus, site, srv,
+                                        fake_web, tmp_path):
+    """The corpus repo has the same shape of writer, so it has the same exposure.
+
+    On 2026-09-14 this was the half that actually broke: the post went live and the
+    corpus write was rejected, leaving the site published and the corpus not — the
+    exact out-of-step state the chain's ordering exists to prevent.
+    """
+    from conftest import sitemap_xml
+
+    write_post(blog, "ready", site)
+    fake_web[f"{site}/blog/ready/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, "ready"))
+    fake_web[f"{site}/assets/og/ready.png"] = 200
+
+    rebuild = "corpus: refresh after source change"
+    _a_workflow_pushes(tmp_path / "corpus-remote.git", tmp_path, "corpus-workflow", rebuild)
+
+    result = srv.publish_post("ready", for_real=True)
+
+    assert result["ok"] is True, result
+    corpus_subjects = _remote_log(tmp_path / "corpus-remote.git")
+    assert "corpus: add ready" in corpus_subjects, "the corpus entry never reached the remote"
+    assert rebuild in corpus_subjects, "the catch-up discarded the rebuild commit"
