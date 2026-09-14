@@ -17,8 +17,21 @@ bad() { echo -e "  ${R}stop${N}  $*"; exit 1; }
 ok "repo root: $(pwd)"
 
 say "sync"
-git pull --rebase
+# --autostash because a re-run starts with the appended test already in the working
+# tree: a plain rebase refuses on unstaged changes, which would make the second run
+# fail for a reason that has nothing to do with the second run.
+git pull --rebase --autostash
 ok "up to date with origin"
+
+# ---------------------------------------------------------------- 0b. tooling
+# A fresh Codespace has the runtime deps but not pytest. Install before anything
+# tries to run tests, and verify by IMPORT rather than by exit code: the mutation
+# check below reads a non-zero pytest as "the test failed", and a missing pytest
+# is also non-zero. Without this the whole verification passes for the wrong reason.
+say "tooling"
+python -m pip install -q -r requirements-dev.txt
+python -c "import pytest" 2>/dev/null || bad "pytest still not importable after install"
+ok "pytest $(python -c 'import pytest; print(pytest.__version__)')"
 
 # ---------------------------------------------------------------- 1. preconditions
 say "preconditions"
@@ -113,13 +126,17 @@ s2 = s2.replace(",\n                              stdin=subprocess.DEVNULL, env=
 assert s2 != s, "could not break the property — mutation check cannot run"
 p.write_text(s2, encoding="utf-8")
 PY
-if python -m pytest tests/test_refusal.py::test_every_subprocess_call_declares_its_stdin -q >/dev/null 2>&1; then
-  cp /tmp/_srv_real.py server.py
-  bad "the test PASSED against a broken server.py — it proves nothing, do not commit it"
-fi
+MUT_OUT=$(python -m pytest tests/test_refusal.py::test_every_subprocess_call_declares_its_stdin -q 2>&1 || true)
 cp /tmp/_srv_real.py server.py
 rm -f /tmp/_srv_real.py
-ok "test fails when the property is broken"
+
+# Require the EXPECTED failure, not merely a non-zero exit. An exit code says
+# "something went wrong"; only the message says "the thing I am testing went wrong."
+# A missing pytest, an import error and a real detection all exit non-zero, and one
+# of those three is not evidence.
+echo "$MUT_OUT" | grep -q "do not pass stdin" \
+  || bad $'the mutation check did not produce the expected failure. pytest said:\n'"$MUT_OUT"
+ok "test fails with the right message when the property is broken"
 
 # ---------------------------------------------------------------- 4. full suite
 say "full suite"
