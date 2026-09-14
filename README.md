@@ -163,34 +163,58 @@ Every solid edge is deterministic code. The only model decision is the diamond a
 
 ## Setup
 
-Run from **this repo**, not the site checkout.
+### Clone the three repos into the same folder
+
+This is the only layout requirement, and everything else follows from it.
 
 ```bash
+mkdir -p ~/rnv && cd ~/rnv
+git clone https://github.com/RNVizion/rnv-publishing-agent.git
+git clone https://github.com/RNVizion/rnvizion.github.io.git
+git clone https://github.com/RNVizion/rnv-ask-the-corpus.git
+```
+
+Any parent folder works — `~/rnv`, a Desktop folder, `D:/dev`, `/workspaces` in a Codespace. `rnv_config.py` derives the site and corpus paths from **this repo's own location**, so the absolute path can differ per machine while the relationship stays the same. Keep the directory names `git clone` gives you; discovery matches on them.
+
+### Install
+
+```bash
+cd rnv-publishing-agent
 python -m venv .venv
 source .venv/bin/activate          # Windows / Git Bash: source .venv/Scripts/activate
 pip install -r requirements.txt    # add -r requirements-dev.txt for the test tooling
 ```
 
-Environment:
+### Configuration — usually none
 
-- `BLOG_REPO` — path to the site checkout (default `/workspaces/rnvizion.github.io`)
-- `CORPUS_REPO` — path to the corpus checkout (default `/workspaces/rnv-ask-the-corpus`)
-- `SITE_URL` — live origin for `wait_for_live` (default `https://rnvizion.dev`)
-- `ANTHROPIC_API_KEY` — **only** for `agent.py`. The tools, the demo, and the test suite need no key.
+Each path resolves in this order:
 
-Those defaults are Codespace paths. **Off a Codespace, set all three explicitly.** An unset variable falls through to a path that doesn't exist and fails late, at commit or corpus time, with a message that doesn't name the real cause. On Windows use `C:/Users/...` form; native Python can't resolve Git Bash's `/c/Users/...`.
+1. the environment — explicit, always wins
+2. `.env` beside this repo — per-machine, gitignored
+3. a sibling checkout — the normal case
+4. nothing found — reported with every path that was tried
 
-Off a Codespace you also need push access to the site repo, which a Codespace grants natively. Confirm with `git push --dry-run` from the site checkout before publishing for real; without it the chain commits locally and then fails at the push.
+Rung 3 is why a fresh machine typically needs no configuration at all. Set something only when your layout does not fit the sibling shape; `.env.example` documents how, and a relative value there resolves against this repo rather than your shell's directory, so it stays portable.
 
-Copy `.env.example` to `.env`, fill it in, and load it in each new shell with `set -a; source .env; set +a` — or export the three from `~/.bashrc`.
+`ANTHROPIC_API_KEY` is the exception: it is needed **only** by `agent.py`. The tools, the demo, and the test suite all run without it.
 
-Then confirm the machine is actually ready:
+### Check before you publish
 
 ```bash
-python tools/preflight.py --slug <slug>            # add --push-check to test push access
+python tools/preflight.py --slug <slug> --push-check
 ```
 
-Preflight is stdlib-only, so it runs before `pip install` and can tell you that is what you still need. It checks interpreter, dependencies, environment, git, and the post's metadata contract, and it reports the *cause* rather than the symptom: an unset `BLOG_REPO` is named as an unset `BLOG_REPO`, not as a missing post. Exit 0 means ready.
+Preflight is stdlib-only, so it also runs **before** `pip install` and will tell you that is what you still need. It checks interpreter, dependencies, resolution, git, push access, and the post's metadata contract, and it reports the *cause* rather than the symptom: an unresolvable `BLOG_REPO` is named as an unresolvable `BLOG_REPO`, not as a missing post. Exit 0 means ready.
+
+Off a Codespace you also need push access to the site repo, which a Codespace grants natively — `--push-check` verifies it.
+
+To ask only "what resolves here, and from which rung?":
+
+```bash
+python rnv_config.py
+```
+
+`rnv_config.py` is a library, imported by both `server.py` and `tools/preflight.py` so the two cannot disagree about where config comes from. Running it directly just prints what it would answer.
 
 Dependencies are the MCP SDK and the Anthropic SDK, both with upper bounds. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
 
