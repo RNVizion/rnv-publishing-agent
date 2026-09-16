@@ -126,6 +126,39 @@ def config_report(for_real: bool = False) -> dict:
             "resolved": describe()}
 
 
+# ---------------------------------------------------------------------------
+# The comment allowlist, owned by the site project.
+#
+# Defined in `_templates/post-template.RULES.md` in rnvizion.github.io: neither the
+# template nor a post carries a comment that explains or instructs. Four structural
+# markers stay, because they navigate rather than explain. This repo ASSERTS against
+# that contract; it does not define it, so the list is copied here only because a
+# check needs something to compare against — if the site project adds a fifth marker,
+# this list is what goes stale, and a post carrying the new marker fails here first.
+#
+# **Checked exactly, as an allowlist.** The RULES.md is explicit that this is not a
+# rule about brevity: "short comments stay" is a heuristic, and the first four-word
+# instruction would defeat it silently.
+#
+# Why it gates rather than warns, under principle 15: does waiting fix it? A stray
+# comment never removes itself, so it is the post's own defect, not a queue. It is
+# also effectively irreversible once shipped — the comment lands in the public git
+# history and rides into the feed's content:encoded, which is how a template note
+# reached dev.to on an earlier post.
+ALLOWED_COMMENTS = frozenset({
+    "<!-- Open Graph -->",
+    "<!-- Fonts -->",
+    "<!-- Blog-index card teaser. -->",
+    "<!-- Standing author bio. -->",
+})
+
+
+def stray_comments(html: str) -> list[str]:
+    """Comments in the post that are not on the site project's allowlist."""
+    found = re.findall(r"<!--.*?-->", html, flags=re.S)
+    return [c.strip() for c in found if c.strip() not in ALLOWED_COMMENTS]
+
+
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
 
@@ -138,23 +171,9 @@ def _meta(html: str, attr: str, value: str) -> str:
     )
     return m.group(2).strip() if m else ""
 
-def _git_env() -> dict:
-    """The environment for a git subprocess, with prompting disabled.
-
-    GIT_TERMINAL_PROMPT=0 turns "ask the user" into an immediate error. Under the MCP
-    transport there is no user to ask and no terminal to ask on, so a prompt is a hang
-    with extra steps. Explicit failure beats silent waiting: the caller can report a
-    credential problem, it cannot report a wait.
-    """
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
-
 def _git(*args):
     """Run a git command inside the blog repo; returns the CompletedProcess."""
-    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, env=_git_env())
+    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True)
 
 @mcp.tool()
 def list_posts() -> list[dict]:
@@ -184,7 +203,11 @@ def validate_post(slug: str) -> dict:
     path = blog_repo() / "blog" / slug / "index.html"
     if not path.exists():
         return {"slug": slug, "ok": False, "error": f"no index.html at blog/{slug}/"}
-    body = _strip_comments(path.read_text(encoding="utf-8"))
+    raw = path.read_text(encoding="utf-8")
+    body = _strip_comments(raw)
+    # Checked on the RAW html: _strip_comments exists so commented-out metadata does
+    # not count as present, which is the opposite of what this needs to see.
+    strays = stray_comments(raw)
     required = {
         "<article> block": bool(re.search(r"<article[^>]*>.*?</article>", body, flags=re.S)),
         "og:url": bool(_meta(body, "property", "og:url")),
@@ -199,96 +222,16 @@ def validate_post(slug: str) -> dict:
     }
     missing_required = [k for k, ok in required.items() if not ok]
     missing_recommended = [k for k, ok in recommended.items() if not ok]
-    return {
+    out = {
         "slug": slug,
-        "ok": not missing_required,
+        "ok": not missing_required and not strays,
         "missing_required": missing_required,
         "missing_recommended": missing_recommended,
     }
-
-def _push_with_catchup(run) -> dict:
-    """Push. If the remote has moved, rebase onto it and push again.
-
-    WHY THIS IS NOT OVER-REACH
-      Both repos this chain writes are written by GitHub Actions too. A publish
-      pushes the post; then build-feed commits the regenerated index, feed, sitemap
-      and robots, and build-og commits the share image, on top of it. So the local
-      clone is behind *after every successful publish*, and the next publish's push
-      is rejected — not because anything is wrong, but because the pipeline did its
-      job. Being behind is the normal resting state here, not an anomaly.
-
-      Which makes it a queue, not a defect, and the project's own rule applies:
-      gate a defect, warn about a queue. Waiting does not fix this one, but catching
-      up does, and catching up is what a person does without thinking. Refusing
-      instead would fail every publish after the first until someone ran git pull by
-      hand — a gate that fires on the normal case is a gate people learn to skip.
-
-    WHY IT REACTS RATHER THAN PREDICTS
-      It pushes first and only catches up on an actual rejection, rather than
-      fetching every time to find out whether it needs to. The remote's answer is
-      the fact; a pre-check is a guess about the same fact, one round trip earlier
-      and one race condition wider.
-
-    WHY REBASE, NEVER MERGE
-      The local side is one publish commit; the remote side is generated output. A
-      merge would record a fork that never conceptually happened and leave the
-      Actions' commits out of order. Replaying the publish on top keeps the history
-      a straight line that reads the way the work actually happened.
-
-    WHY A CONFLICT ABORTS
-      A conflict means the two sides changed the same lines, which is not a queue and
-      is not fixed by waiting or retrying. It aborts the rebase — restoring the tree,
-      including anything --autostash had set aside — and reports. Half-rebased is the
-      one state worse than not having tried.
-
-    Bought on 2026-09-14: the corpus push was rejected because the rebuild-corpus
-    Action had pushed since the last run. The post was already live by then, so the
-    chain ended with the site published and the corpus not updated — the two out of
-    step, which is the exact half-done state the ordering everywhere else exists to
-    prevent.
-    """
-    push = run("push")
-    if push.returncode == 0:
-        return {"ok": True, "caught_up": False}
-
-    err = (push.stderr or "").strip()
-    # Only a non-fast-forward is a catch-up situation. Everything else — no
-    # credentials, no network, a protected branch — is a real failure, and retrying
-    # after a rebase would turn one clear error into two confusing ones.
-    behind = any(s in err for s in ("fetch first", "non-fast-forward", "behind its remote"))
-    if not behind:
-        return {"ok": False, "caught_up": False, "error": err or "git push failed"}
-
-    # Fetch first, and this is not belt-and-braces. A rejected push does NOT update
-    # the remote-tracking ref, so origin/main — which is what @{u} resolves to — still
-    # points where it did before the rejection. Rebasing onto it without fetching
-    # reports "Current branch main is up to date" and changes nothing, after which the
-    # retry is rejected for exactly the same reason: a repair that silently no-ops and
-    # then fails identically, which reads as the fix not working rather than the fix
-    # not having run. Found by running it.
-    fetch = run("fetch", "--quiet", "origin")
-    if fetch.returncode != 0:
-        return {"ok": False, "caught_up": False,
-                "error": f"push was rejected and the remote could not be fetched to catch up: "
-                         f"{(fetch.stderr or '').strip() or 'fetch failed'}"}
-
-    # --autostash because the working tree legitimately carries other changes here:
-    # commit_and_push stages only the post, so a regenerated feed.xml sitting
-    # unstaged is normal and must not block the catch-up or be swept into it.
-    rebase = run("rebase", "--autostash", "@{u}")
-    if rebase.returncode != 0:
-        run("rebase", "--abort")
-        return {"ok": False, "caught_up": False,
-                "error": f"the remote had moved and the catch-up rebase failed, so nothing "
-                         f"was pushed: {(rebase.stderr or '').strip() or 'rebase failed'}"}
-
-    again = run("push")
-    if again.returncode != 0:
-        return {"ok": False, "caught_up": True,
-                "error": (again.stderr or "").strip() or "git push failed after catching up"}
-
-    return {"ok": True, "caught_up": True}
-
+    if strays:
+        out["stray_comments"] = strays
+        out["error"] = "comment"
+    return out
 
 @mcp.tool()
 def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:
@@ -321,18 +264,12 @@ def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict
     commit = _git("commit", "-m", msg)
     if commit.returncode != 0:
         return {"slug": slug, "ok": False, "error": commit.stderr.strip() or "git commit failed"}
-    push = _push_with_catchup(_git)
-    if not push["ok"]:
+    push = _git("push")
+    if push.returncode != 0:
         return {"slug": slug, "ok": False, "committed": True, "pushed": False,
-                "error": push["error"]}
-    out = {"slug": slug, "ok": True, "committed": True, "pushed": True,
-           "message": msg, "files": pending}
-    # Present only when it happened, the same way `warnings` is. A field that reads
-    # false on almost every run is noise in a trace a human reads, and its absence
-    # is already the answer.
-    if push["caught_up"]:
-        out["caught_up"] = True
-    return out
+                "error": push.stderr.strip() or "git push failed"}
+    return {"slug": slug, "ok": True, "committed": True, "pushed": True,
+            "message": msg, "files": pending}
 
 def _fetch_text(url: str, timeout: int = 15):
     """GET a URL; return (status, body_text). Status is the error string if
@@ -358,35 +295,6 @@ def _head_status(url: str, timeout: int = 15):
         return e.code
     except Exception as e:  # connection errors, timeouts, DNS, etc.
         return str(e)
-
-def _progress(what: str, elapsed: float, budget: int, detail: str = "") -> None:
-    """Report that a poll is still waiting. Written to stderr, and only to stderr.
-
-    stdout is the MCP protocol stream; writing there corrupts the transport. stderr is
-    forwarded to the caller's terminal by stdio_client (its `errlog` parameter
-    defaults to sys.stderr), and on the direct route it is simply the terminal. So it
-    is the only channel a tool has for saying anything at all before it returns.
-
-    These lines carry no meaning for any caller. The return value is still the entire
-    result and nothing parses this output — which is the point: a progress line that
-    something depends on is an undeclared protocol, and the next person to reword it
-    breaks a consumer nobody knew existed.
-
-    Why it exists. publish_post returns one result at the end, so across the three
-    polls here — up to 330 seconds at the default budgets — a correct slow publish and
-    a dead process are byte-identical from outside: both are a blank terminal. On
-    2026-09-14 that silence was read as a hang and the run was killed four minutes
-    after it had already committed, pushed, and gone live; recovering from the
-    "failure" cost three hours and republished the post four times. The chain was
-    right and unreadable, and unreadable was the expensive half.
-
-    Printed only when about to sleep, never before the first attempt, so a check that
-    succeeds immediately stays silent. Waiting is the thing worth announcing; working
-    is not.
-    """
-    print(f"  ... waiting on {what}: {elapsed:.0f}s of {budget}s{detail}",
-          file=sys.stderr, flush=True)
-
 
 @mcp.tool()
 def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
@@ -439,8 +347,6 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
         if time.monotonic() >= deadline:
             return {"slug": slug, "ok": False, "live": False, "url": url,
                     "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
-        _progress("the page", timeout - (deadline - time.monotonic()), timeout,
-                  f" (last status: {last})")
         time.sleep(max(interval, 1))
 
     result = {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
@@ -467,8 +373,6 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                 f"running, so the blog index and feed may not show this post yet"
             )
             break
-        _progress("the sitemap", sitemap_timeout - (sm_deadline - time.monotonic()),
-                  sitemap_timeout, f" (last status: {sm_status})")
         time.sleep(max(interval, 1))
 
     # Now confirm the og:image the post declares is reachable.
@@ -499,8 +403,6 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
                 f"the build-og Action may still be running, or failed to render {og_image}"
             )
             return result
-        _progress("the share image", og_timeout - (og_deadline - time.monotonic()),
-                  og_timeout, f" (last status: {og_last})")
         time.sleep(max(interval, 1))
 
 @mcp.tool()
@@ -542,8 +444,7 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     sources_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     def _cgit(*args):
-        return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, env=_git_env())
+        return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True, text=True)
 
     add = _cgit("add", "--", "sources.json")
     if add.returncode != 0:
@@ -551,15 +452,12 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     commit = _cgit("commit", "-m", f"corpus: add {slug}")
     if commit.returncode != 0:
         return {"slug": slug, "ok": False, "added": True, "error": commit.stderr.strip() or "git commit failed"}
-    push = _push_with_catchup(_cgit)
-    if not push["ok"]:
+    push = _cgit("push")
+    if push.returncode != 0:
         return {"slug": slug, "ok": False, "added": True, "pushed": False,
-                "error": push["error"] + " (corpus repo write permission?)"}
-    out = {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
-           "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
-    if push["caught_up"]:
-        out["caught_up"] = True
-    return out
+                "error": push.stderr.strip() or "git push failed (corpus repo write permission?)"}
+    return {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
+            "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
 
 @mcp.tool()
 def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
