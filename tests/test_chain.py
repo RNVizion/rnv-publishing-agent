@@ -224,7 +224,7 @@ def test_og_image_that_catches_up_produces_no_warning(blog, blog_remote, corpus,
     """The image poll keeps looking, so a share card that lands in time is not reported late.
 
     Counterpart to test_lagging_og_image_warns_but_does_not_fail, and the thing that
-    makes the image leniency leniency rather than blindness: a check that gave up
+    makes the image leniency rather than blindness: a check that gave up
     after one look could never tell 'late' from 'never'.
 
     The sitemap has had this counterpart since the two-wave deploy was understood.
