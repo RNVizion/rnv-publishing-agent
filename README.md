@@ -129,7 +129,7 @@ On a real publish, `wait_for_live` gates on the post URL (180s), then polls the 
 The agent edits the **site** repo directly and pushes natively. The heavier work runs in CI instead, where it belongs:
 
 - **The index, feed, and share image.** On the push, two Actions in the site repo regenerate the blog index and RSS feed from the posts (`build-feed`) and render the per-post Open Graph image (`build-og`), each committing its output back. Image rendering, font handling, and HTML generation never touch the publishing environment.
-- **The RAG rebuild.** `update_corpus` commits a one-line source change to the corpus repo, and a GitHub Action there re-ingests and pushes the vector store to a Hugging Face Space. The heavy ML dependencies and the Hugging Face token stay in CI, never in the publishing environment.
+- **The RAG rebuild.** `update_corpus` adds one entry to `sources.json` on the corpus repo's `main`, as a single commit built on `main` itself. It decides against `main` rather than the local checkout, because a six-hourly Action in the corpus repo registers new posts from the feed too. A workflow there then rebuilds the index, commits it, gates it, and ships it to a Hugging Face Space. The heavy ML dependencies and the Hugging Face token stay in CI, never in the publishing environment.
 
 ```mermaid
 flowchart TD
