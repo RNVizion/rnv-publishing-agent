@@ -60,7 +60,7 @@ The orchestration itself is code, not a prompt. `publish_post` runs the chain in
 `publish_post(slug, for_real)` runs, in order:
 
 1. `validate_post` — checks the post carries everything the feed needs; **stops the publish if a required field is missing**
-2. `commit_and_push` — stages and commits the post, then pushes
+2. `commit_and_push` — publishes the post as one commit on the site repo's `main`, carrying that one file
 3. `wait_for_live` — polls the live URL until it returns 200, so nothing downstream runs against a page that hasn't deployed; then confirms the site itself caught up, by checking that the sitemap lists the post and that the `og:image` is reachable, flagging either if not
 4. `update_corpus` — registers the post with the RAG corpus and triggers a rebuild
 
@@ -75,6 +75,7 @@ The agent would rather publish nothing than publish something half-built.
 - `validate_post` separates required fields from recommended ones; a missing required field halts the chain with an exact report of what's absent.
 - `update_corpus` refuses to register a URL that isn't live, so the assistant's knowledge base never points at a 404.
 - `wait_for_live` gates the corpus rebuild behind a confirmed-live page.
+- Both writers ask the remote rather than their own checkout. Each repo here is written by GitHub Actions too, so a local clone is a cache that nothing keeps current; `commit_and_push` and `update_corpus` each fetch `main`, decide against it, and build their one commit on top of it. A push rejected because `main` moved re-makes the decision instead of replaying it, and a push that fails leaves nothing behind on the branch.
 
 Each tool returns `{ ok, ... }`, so the chain reasons about success structurally instead of parsing prose.
 
@@ -92,7 +93,7 @@ If a consumer ever reads the sitemap rather than the post URL, that check stops 
 | --- | --- |
 | `list_posts` | Enumerate published posts with slug, title, date |
 | `validate_post` | Gate: required vs. recommended fields |
-| `commit_and_push` | Stage and commit the post, push |
+| `commit_and_push` | Publish the post: one commit on `main`, one file |
 | `wait_for_live` | Poll until the page serves 200, then confirm the sitemap lists it and the `og:image` renders (both warn-only) |
 | `update_corpus` | Register the post and trigger a RAG rebuild |
 | `publish_post` | Run the whole chain, stopping at the first failure |
