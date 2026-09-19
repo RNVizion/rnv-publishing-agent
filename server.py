@@ -184,10 +184,74 @@ def _git_env() -> dict:
     return env
 
 
-def _git(*args):
-    """Run a git command inside the blog repo; returns the CompletedProcess."""
-    return subprocess.run(["git", *args], cwd=blog_repo(), capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, env=_git_env())
+def _git_in(repo, *args, index: str | None = None):
+    """Run git inside `repo`; returns the CompletedProcess.
+
+    The one place this module starts a subprocess, which is what makes the stdin
+    rule above a property of the module rather than a habit at each call site.
+
+    `index` points git at a private index file, so a commit can be assembled without
+    touching the operator's staging area. Output is decoded as UTF-8 rather than in
+    the locale's encoding: git returns file contents here — a post carries curly
+    quotes by house style — and a Windows code page would mangle them.
+    """
+    env = _git_env()
+    if index is not None:
+        env["GIT_INDEX_FILE"] = index
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True,
+                          encoding="utf-8", errors="replace",
+                          stdin=subprocess.DEVNULL, env=env)
+
+
+def _stderr_or(proc, default: str) -> str:
+    return (proc.stderr or "").strip() or default
+
+
+# Push stderr meaning "the remote moved since you looked". Both pushes answer it the
+# same way: fetch the new main and make the whole decision again, never replay the
+# one already made. Anything else is a real failure.
+_REMOTE_MOVED = ("fetch first", "non-fast-forward", "behind its remote")
+
+# Push stderr that names an access problem. The write-permission hint is reserved
+# for these. Appended to every push failure, it once captioned a rebase conflict and
+# sent the reader to check credentials that were fine. "returned error: 403" rather
+# than a bare "403": the message also carries the remote's path, and a bare number
+# can turn up in any path.
+_PERMISSION_MARKERS = ("permission", "returned error: 403", "authentication failed",
+                       "could not read username")
+
+
+def _commit_file_on(run, base: str, path: str, blob: str, message: str) -> dict:
+    """Build a commit on `base` whose one change is `path` becoming `blob`.
+
+    Assembled in a private index, so the checkout's staging area, working tree and
+    branch are never part of it: the commit is exactly `base` plus this one file.
+    Nothing already staged in the checkout can ride along. The commit is on no
+    branch; until a push lands it, it is an object nothing points at, which is what
+    lets a failure leave nothing behind.
+
+    Shared by both writers. What each one puts in the blob differs — the corpus
+    derives its entry from main, the site carries the author's file through — but
+    "main plus exactly one path" is one mechanism and is written once.
+    """
+    listing = run("ls-tree", base, "--", path).stdout.split()
+    mode = listing[0] if listing else "100644"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        index = str(Path(tmp) / "index")
+        for args in (("read-tree", base),
+                     ("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")):
+            step = run(*args, index=index)
+            if step.returncode != 0:
+                return {"ok": False, "error": _stderr_or(step, f"git {args[0]} failed")}
+        tree = run("write-tree", index=index)
+        if tree.returncode != 0:
+            return {"ok": False, "error": _stderr_or(tree, "git write-tree failed")}
+
+    commit = run("commit-tree", tree.stdout.strip(), "-p", base, "-m", message)
+    if commit.returncode != 0:
+        return {"ok": False, "error": _stderr_or(commit, "git commit-tree failed")}
+    return {"ok": True, "sha": commit.stdout.strip()}
 
 @mcp.tool()
 def list_posts() -> list[dict]:
@@ -247,146 +311,185 @@ def validate_post(slug: str) -> dict:
         out["error"] = "comment"
     return out
 
-# Push stderr meaning "the remote moved since you looked". Only these are a catch-up
-# situation; anything else is a real failure. Shared by the site push, which rebases
-# onto the move, and the corpus registration, which decides again against it.
-_REMOTE_MOVED = ("fetch first", "non-fast-forward", "behind its remote")
+# The site repo's branch. Pages serves it and both generator Actions trigger on it,
+# so a publish that lands on any other branch is one nobody ever sees.
+SITE_BRANCH = "main"
+
+# How many times a publish starts over when main moves under it. Each attempt is a
+# fresh fetch and a fresh decision, never a replay of the last one.
+_PUBLISH_ATTEMPTS = 3
 
 
-def _push_with_catchup(run) -> dict:
-    """Push. If the remote has moved, rebase onto it and push again.
+def _site_git(*args, index: str | None = None):
+    """Run git inside the site repo; returns the CompletedProcess."""
+    return _git_in(blog_repo(), *args, index=index)
 
-    WHY THIS IS NOT OVER-REACH
-      Both repos this chain writes are written by GitHub Actions too. A publish
-      pushes the post; then build-feed commits the regenerated index, feed, sitemap
-      and robots, and build-og commits the share image, on top of it. So the local
-      clone is behind *after every successful publish*, and the next publish's push
-      is rejected — not because anything is wrong, but because the pipeline did its
-      job. Being behind is the normal resting state here, not an anomaly.
 
-      Which makes it a queue, not a defect, and the project's own rule applies:
-      gate a defect, warn about a queue. Waiting does not fix this one, but catching
-      up does, and catching up is what a person does without thinking. Refusing
-      instead would fail every publish after the first until someone ran git pull by
-      hand — a gate that fires on the normal case is a gate people learn to skip.
+def _fast_forward_site_checkout(target: str, post: str) -> str:
+    """Move the operator's branch onto the publish that just landed.
 
-    WHY IT REACTS RATHER THAN PREDICTS
-      It pushes first and only catches up on an actual rejection, rather than
-      fetching every time to find out whether it needs to. The remote's answer is
-      the fact; a pre-check is a guess about the same fact, one round trip earlier
-      and one race condition wider.
+    Returns "" once the checkout shows it, or else the reason it was left alone.
 
-    WHY REBASE, NEVER MERGE
-      The local side is one publish commit; the remote side is generated output. A
-      merge would record a fork that never conceptually happened and leave the
-      Actions' commits out of order. Replaying the publish on top keeps the history
-      a straight line that reads the way the work actually happened.
+    WHY THIS IS A RESET AND WHY THAT IS SAFE
+      The post is the one path that differs, and the working tree's copy of it is
+      byte-identical to `target`'s, because `target` was built from that exact blob
+      moments ago. So moving there discards nothing: the author's bytes are already
+      in the commit. `merge --ff-only` and `reset --keep` both refuse anyway — tried
+      on 2026-09-18, both stop at "local changes would be overwritten", because they
+      read the post as dirty without noticing where those bytes went.
 
-    WHY A CONFLICT ABORTS
-      A conflict means the two sides changed the same lines, which is not a queue and
-      is not fixed by waiting or retrying. It aborts the rebase — restoring the tree,
-      including anything --autostash had set aside — and reports. Half-rebased is the
-      one state worse than not having tried.
-
-    Bought on 2026-09-14: the corpus push was rejected because the rebuild-corpus
-    Action had pushed since the last run. The post was already live by then, so the
-    chain ended with the site published and the corpus not updated — the two out of
-    step, which is the exact half-done state the ordering everywhere else exists to
-    prevent.
-
-    SITE ONLY, SINCE 2026-09-18
-      The corpus registration used this until then and no longer does. Replaying a
-      commit is right when the commit is the author's work, as the post is. It was
-      wrong for the corpus entry, because whether that entry was needed had already
-      been decided against a stale checkout before the rebase ran, and a rebase
-      replays a decision without re-making it. update_corpus now derives its entry on
-      top of main instead; see there.
+      Which leaves `reset --hard`, and it is only safe under the conditions checked
+      below. Tried in the same session: with an unrelated tracked file modified, it
+      published correctly and silently reverted that file. So anything else modified
+      or staged means this refuses and says what it found. Untracked files are not a
+      reason to refuse — `reset --hard` does not remove them, confirmed alongside.
     """
-    push = run("push")
-    if push.returncode == 0:
-        return {"ok": True, "caught_up": False}
+    branch = _site_git("symbolic-ref", "--quiet", "--short", "HEAD")
+    on = branch.stdout.strip()
+    if branch.returncode != 0 or on != SITE_BRANCH:
+        return f"it is on {on or 'a detached HEAD'}, not {SITE_BRANCH}"
+    if _site_git("merge-base", "--is-ancestor", "HEAD", target).returncode != 0:
+        return f"its {SITE_BRANCH} carries commits the remote's does not"
 
-    err = (push.stderr or "").strip()
-    # Only a non-fast-forward is a catch-up situation. Everything else — no
-    # credentials, no network, a protected branch — is a real failure, and retrying
-    # after a rebase would turn one clear error into two confusing ones.
-    behind = any(s in err for s in _REMOTE_MOVED)
-    if not behind:
-        return {"ok": False, "caught_up": False, "error": err or "git push failed"}
+    dirty = _site_git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode != 0:
+        return _stderr_or(dirty, "git status failed")
+    # line[3:] is the path; a rename reads "old -> new" and will not match `post`,
+    # so it lands in `others` and this refuses. Failing toward refusing is correct:
+    # the cost of refusing is a pull, and the cost of not is somebody's work.
+    others = sorted({line[3:].strip() for line in dirty.stdout.splitlines() if line.strip()}
+                    - {post})
+    if others:
+        return f"it has other changes that a reset would discard: {', '.join(others)}"
 
-    # Fetch first, and this is not belt-and-braces. A rejected push does NOT update
-    # the remote-tracking ref, so origin/main — which is what @{u} resolves to — still
-    # points where it did before the rejection. Rebasing onto it without fetching
-    # reports "Current branch main is up to date" and changes nothing, after which the
-    # retry is rejected for exactly the same reason: a repair that silently no-ops and
-    # then fails identically, which reads as the fix not working rather than the fix
-    # not having run. Found by running it.
-    fetch = run("fetch", "--quiet", "origin")
-    if fetch.returncode != 0:
-        return {"ok": False, "caught_up": False,
-                "error": f"push was rejected and the remote could not be fetched to catch up: "
-                         f"{(fetch.stderr or '').strip() or 'fetch failed'}"}
-
-    # --autostash because the working tree legitimately carries other changes here:
-    # commit_and_push stages only the post, so a regenerated feed.xml sitting
-    # unstaged is normal and must not block the catch-up or be swept into it.
-    rebase = run("rebase", "--autostash", "@{u}")
-    if rebase.returncode != 0:
-        run("rebase", "--abort")
-        return {"ok": False, "caught_up": False,
-                "error": f"the remote had moved and the catch-up rebase failed, so nothing "
-                         f"was pushed: {(rebase.stderr or '').strip() or 'rebase failed'}"}
-
-    again = run("push")
-    if again.returncode != 0:
-        return {"ok": False, "caught_up": True,
-                "error": (again.stderr or "").strip() or "git push failed after catching up"}
-
-    return {"ok": True, "caught_up": True}
+    reset = _site_git("reset", "--hard", "--quiet", target)
+    if reset.returncode != 0:
+        return _stderr_or(reset, "git reset failed")
+    return ""
 
 
 @mcp.tool()
 def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:
-    """Stage and commit the post, then push to the remote.
+    """Publish the post: one commit on the site repo's main, carrying one file.
 
-    Stages only blog/<slug>/index.html — the one file a publish writes. The blog
-    index and feed are regenerated and committed by the build-feed GitHub Action
-    on this push, and the OG share image by the build-og Action, so none of those
-    are committed here. Idempotent: if the post has no changes, it reports nothing
-    to commit rather than erroring.
-    dry_run=True reports what would be committed without writing or pushing."""
+    The commit is blog/<slug>/index.html and nothing else. The blog index, feed,
+    sitemap and robots are regenerated and committed by the build-feed Action on this
+    push, and the share image by build-og, so none of those are committed here.
+
+    WHY IT DECIDES AGAINST MAIN, NOT THE LOCAL BRANCH
+      Being behind is the normal resting state of this checkout: both Actions commit
+      on top of every publish, so the clone is out of date seconds after each one. A
+      tool that asks the local branch "does this post need publishing?" is asking a
+      cache that nothing keeps current. It answered wrong three ways, all reproduced
+      on 2026-09-18 against this suite's fixtures:
+
+        - after a refused push, the commit stayed on the local branch; the re-run
+          saw the post matching that commit, reported "nothing to commit" and
+          "published: true", and main never received it. A new post instead timed
+          out in wait_for_live, reported as *not live* when the cause was *never
+          pushed*.
+        - a catch-up rebase that emptied the commit still reported "pushed".
+        - the push sent every unpushed commit on the branch, not only the post's.
+
+      So the question is put to main. `git hash-object` on the working tree's file
+      gives the exact blob a publish would carry; main's copy of that path is one
+      `rev-parse` away; equal hashes mean the published post is already this file,
+      which is the real answer to "is there anything to do".
+
+    WHY IT BUILDS THE COMMIT RATHER THAN COMMITTING AND PUSHING ONE
+      The commit is assembled in a private index as main plus that one blob, so
+      nothing in the checkout — its branch, its staging area, its other unpushed
+      commits — can ride along. Until the push lands it is an object nothing points
+      at, which is what lets a failure leave nothing behind. If main moves in
+      between, the push is rejected and the whole decision runs again against the
+      new main, including whether the post still needs publishing at all.
+
+      This differs from update_corpus in what is rebuilt, and the difference matters.
+      A corpus entry is derived, so it can be recomputed from main. A post is
+      authored and cannot be; what is re-derived here is only the commit, and the
+      author's bytes are carried through untouched.
+
+    Once the push lands, the operator's branch is fast-forwarded onto it when that is
+    safe, so their checkout ends clean; when it is not, `checkout_warning` says the
+    checkout was left where it was. A warning, not a failure: main is right, and
+    nothing decides from the checkout any more.
+
+    Idempotent: a post already published as this exact file reports nothing to
+    commit. dry_run=True fetches main and makes the same decision, without writing
+    or pushing.
+    """
     post = f"blog/{slug}/index.html"
     msg = message or f"Publish: {slug}"
+    post_path = blog_repo() / "blog" / slug / "index.html"
 
-    status = _git("status", "--porcelain", "--", post)
-    if status.returncode != 0:
-        return {"slug": slug, "ok": False, "error": status.stderr.strip() or "git status failed"}
-    pending = [line[3:] for line in status.stdout.splitlines() if line.strip()]
-    if not pending:
-        return {"slug": slug, "ok": True, "committed": False,
-                "reason": "nothing to commit (post already up to date)"}
+    # A missing post is an error, not "nothing to commit". `git status` on a path
+    # that does not exist and is not tracked reports nothing, which the old code read
+    # as "already up to date" — the fail-open shape of this whole defect, one layer
+    # down and reachable by calling this tool on its own.
+    if not post_path.is_file():
+        return {"slug": slug, "ok": False, "committed": False,
+                "error": f"{post} does not exist under {blog_repo()}; there is nothing to publish"}
 
-    if dry_run:
-        return {"slug": slug, "ok": True, "committed": False,
-                "would_commit": pending, "message": msg}
+    tracking = f"refs/remotes/origin/{SITE_BRANCH}"
+    for attempt in range(1, _PUBLISH_ATTEMPTS + 1):
+        fetch = _site_git("fetch", "--quiet", "origin", f"+refs/heads/{SITE_BRANCH}:{tracking}")
+        if fetch.returncode != 0:
+            return {"slug": slug, "ok": False, "committed": False, "pushed": False,
+                    "error": f"could not fetch the site's {SITE_BRANCH}, so nothing was decided "
+                             f"or written: {_stderr_or(fetch, 'git fetch failed')}"}
+        base = _site_git("rev-parse", "--verify", "--quiet", f"{tracking}^{{commit}}").stdout.strip()
+        if not base:
+            return {"slug": slug, "ok": False, "committed": False, "pushed": False,
+                    "error": f"the site repo has no {SITE_BRANCH} on its remote to publish onto"}
 
-    add = _git("add", "--", post)
-    if add.returncode != 0:
-        return {"slug": slug, "ok": False, "error": add.stderr.strip() or "git add failed"}
-    commit = _git("commit", "-m", msg)
-    if commit.returncode != 0:
-        return {"slug": slug, "ok": False, "error": commit.stderr.strip() or "git commit failed"}
-    push = _push_with_catchup(_git)
-    if not push["ok"]:
-        return {"slug": slug, "ok": False, "committed": True, "pushed": False,
-                "error": push["error"]}
+        # -w writes the blob now, so the thing compared and the thing published are
+        # one object rather than two reads of a file that could change in between.
+        blob = _site_git("hash-object", "-w", "--no-filters", "--", str(post_path))
+        if blob.returncode != 0:
+            return {"slug": slug, "ok": False, "committed": False,
+                    "error": _stderr_or(blob, "git hash-object failed")}
+        authored = blob.stdout.strip()
+        published = _site_git("rev-parse", "--verify", "--quiet", f"{base}:{post}").stdout.strip()
+
+        if published == authored:
+            return {"slug": slug, "ok": True, "committed": False,
+                    "reason": f"nothing to commit ({SITE_BRANCH} already has this exact post)"}
+        if dry_run:
+            return {"slug": slug, "ok": True, "committed": False,
+                    "would_commit": [post], "message": msg,
+                    "change": "update" if published else "add"}
+
+        built = _commit_file_on(_site_git, base, post, authored, msg)
+        if not built["ok"]:
+            return {"slug": slug, "ok": False, "committed": False, "pushed": False,
+                    "error": f"could not build the publish commit: {built['error']}"}
+
+        push = _site_git("push", "origin", f"{built['sha']}:refs/heads/{SITE_BRANCH}")
+        if push.returncode == 0:
+            break
+        err = _stderr_or(push, "git push failed")
+        if any(m in err for m in _REMOTE_MOVED):
+            continue    # main moved since the fetch: decide again, against the new main
+        if any(m in err.lower() for m in _PERMISSION_MARKERS):
+            err += " (site repo write permission?)"
+        return {"slug": slug, "ok": False, "committed": False, "pushed": False, "error": err}
+    else:
+        return {"slug": slug, "ok": False, "committed": False, "pushed": False,
+                "error": f"the site's {SITE_BRANCH} moved during each of {_PUBLISH_ATTEMPTS} "
+                         f"attempts, so nothing was pushed; a re-run is safe"}
+
     out = {"slug": slug, "ok": True, "committed": True, "pushed": True,
-           "message": msg, "files": pending}
-    # Present only when it happened, the same way `warnings` is. A field that reads
-    # false on almost every run is noise in a trace a human reads, and its absence
-    # is already the answer.
-    if push["caught_up"]:
+           "message": msg, "files": [post], "commit": built["sha"][:7]}
+    # Present only when it happened. A field that reads false on almost every run is
+    # noise in a trace a human reads, and its absence is already the answer.
+    if attempt > 1:
         out["caught_up"] = True
+    held = _fast_forward_site_checkout(built["sha"], post)
+    if held:
+        out["checkout_warning"] = (
+            f"published on {SITE_BRANCH}; your local site checkout was left where it was "
+            f"because {held}. Nothing is wrong on {SITE_BRANCH}; pull when convenient"
+        )
     return out
 
 def _fetch_text(url: str, timeout: int = 15):
@@ -566,67 +669,23 @@ CORPUS_BRANCH = "main"
 # is a fresh fetch and a fresh decision; three matches ship-index.yml's own loop.
 _REGISTER_ATTEMPTS = 3
 
-# Push stderr that names an access problem. The write-permission hint is reserved
-# for these. Appended to every push failure, it once captioned a rebase conflict and
-# sent the reader to check credentials that were fine. "returned error: 403" rather
-# than a bare "403": the message also carries the remote's path, and a bare number
-# can turn up in any path.
-_PERMISSION_MARKERS = ("permission", "returned error: 403", "authentication failed",
-                       "could not read username")
-
-
 def _corpus_git(*args, index: str | None = None):
-    """Run git inside the corpus repo; returns the CompletedProcess.
-
-    `index` points git at a private index file, so a registration can be assembled
-    without touching the operator's staging area. Output is decoded as UTF-8 rather
-    than in the locale's encoding, because `git show` returns file contents here and
-    a Windows code page would mangle anything outside ASCII."""
-    env = _git_env()
-    if index is not None:
-        env["GIT_INDEX_FILE"] = index
-    return subprocess.run(["git", *args], cwd=corpus_repo(), capture_output=True,
-                          encoding="utf-8", errors="replace",
-                          stdin=subprocess.DEVNULL, env=env)
-
-
-def _stderr_or(proc, default: str) -> str:
-    return (proc.stderr or "").strip() or default
+    """Run git inside the corpus repo; returns the CompletedProcess."""
+    return _git_in(corpus_repo(), *args, index=index)
 
 
 def _corpus_commit_on(base: str, content: str, message: str) -> dict:
     """Build a commit on `base` whose one change is sources.json becoming `content`.
 
-    Assembled in a private index, so the checkout's staging area, working tree and
-    branch are never part of it: the commit is exactly `base` plus this one file.
-    Nothing already staged in the checkout can ride along, chroma/ included. The
-    commit is on no branch; until a push lands it, it is an object nothing points
-    at, which is what lets a failure leave nothing behind."""
+    The entry is derived from `base` by the caller, so this only has to get those
+    bytes into the object store; _commit_file_on does the rest."""
     with tempfile.TemporaryDirectory() as tmp:
         body = Path(tmp) / "sources.json"
         body.write_bytes(content.encode("utf-8"))   # bytes, so no newline translation
-        index = str(Path(tmp) / "index")
-
         blob = _corpus_git("hash-object", "-w", "--no-filters", "--", str(body))
         if blob.returncode != 0:
             return {"ok": False, "error": _stderr_or(blob, "git hash-object failed")}
-        listing = _corpus_git("ls-tree", base, "--", "sources.json").stdout.split()
-        mode = listing[0] if listing else "100644"
-
-        for args in (("read-tree", base),
-                     ("update-index", "--add", "--cacheinfo",
-                      f"{mode},{blob.stdout.strip()},sources.json")):
-            step = _corpus_git(*args, index=index)
-            if step.returncode != 0:
-                return {"ok": False, "error": _stderr_or(step, f"git {args[0]} failed")}
-        tree = _corpus_git("write-tree", index=index)
-        if tree.returncode != 0:
-            return {"ok": False, "error": _stderr_or(tree, "git write-tree failed")}
-
-    commit = _corpus_git("commit-tree", tree.stdout.strip(), "-p", base, "-m", message)
-    if commit.returncode != 0:
-        return {"ok": False, "error": _stderr_or(commit, "git commit-tree failed")}
-    return {"ok": True, "sha": commit.stdout.strip()}
+    return _commit_file_on(_corpus_git, base, "sources.json", blob.stdout.strip(), message)
 
 
 def _bring_corpus_checkout_along(target: str) -> str:
@@ -831,6 +890,8 @@ def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
     cp = step("commit_and_push", commit_and_push(slug))
     if not cp.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "commit_and_push", "trace": trace}
+    if cp.get("checkout_warning"):
+        warnings.append(cp["checkout_warning"])
 
     live = step("wait_for_live", wait_for_live(slug, timeout=timeout, interval=interval,
                                                og_timeout=og_timeout,
