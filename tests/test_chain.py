@@ -337,6 +337,14 @@ def test_a_publish_catches_up_when_a_workflow_has_pushed(blog, blog_remote, corp
     — correctly, and uselessly. Refusing here would fail every publish after the
     first until someone ran git pull by hand, and a gate that fires on the normal
     case is a gate people learn to skip.
+
+    The mechanism under this changed on 2026-09-18 and the requirement did not. It
+    was a rebase of the local publish commit onto the moved remote; it is now a fetch
+    and a commit built on main, which reaches the same place without replaying a
+    decision. What this test pins is the behaviour either mechanism owes: the
+    workflow's commit survives, the publish sits on top of it, and no merge appears.
+    It is deliberately silent on how. Catching up *mid-publish* is
+    test_site_push.py's test_main_moving_mid_publish_is_decided_again.
     """
     from conftest import sitemap_xml
 
