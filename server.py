@@ -552,7 +552,21 @@ def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict
 
         # -w writes the blob now, so the thing compared and the thing published are
         # one object rather than two reads of a file that could change in between.
-        blob = _site_git("hash-object", "-w", "--no-filters", "--", str(post_path))
+        #
+        # FILTERS ARE APPLIED, and the absence of --no-filters here is deliberate.
+        # This hash is compared against main's blob for a TRACKED path, and main's
+        # blob is what git stored after its own filters ran. On a checkout with
+        # core.autocrlf=true — the normal Windows/Git Bash setup, which this
+        # operator uses — the working tree holds CRLF while the blob holds LF, so
+        # hashing the raw bytes compares two things git never claimed were equal.
+        # Measured on 2026-09-20 in a faithful Windows-style clone: git status
+        # reported the tree clean, --no-filters mismatched main, and filters
+        # applied matched it exactly. With --no-filters this would have decided
+        # every unchanged post needed republishing, and committed CRLF over the
+        # whole file each time. _corpus_commit_on keeps --no-filters for the
+        # opposite reason: it hashes bytes this agent authored, in a temp file
+        # outside the repo, where verbatim is the intent and no filter applies.
+        blob = _site_git("hash-object", "-w", "--", str(post_path))
         if blob.returncode != 0:
             return {"slug": slug, "ok": False, "committed": False,
                     "error": _stderr_or(blob, "git hash-object failed")}
