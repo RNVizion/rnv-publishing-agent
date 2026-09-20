@@ -85,6 +85,36 @@ def isolate_dotenv(monkeypatch, tmp_path):
     monkeypatch.setattr(rnv_config, "DOTENV_PATH", tmp_path / "absent.env")
 
 
+# The site project's post-shape library, which validate_post imports from the site
+# checkout. A real site repo has carried scripts/post_shape.py since 2026-09-20, so
+# a fixture without one is not a smaller site repo, it is a broken one — and the
+# agent correctly refuses to publish against it.
+#
+# The default plant answers "nothing beside the post" to both questions. That is the
+# honest answer for these fixtures' posts and keeps every other test testing what it
+# came to test. Tests that are ABOUT the shape check plant their own and say what it
+# returns, so what is pinned is this repo's handling of the answer rather than a
+# second copy of the site project's parser, which is the thing importing exists to
+# avoid. The parser itself is tested where it lives, against its own vectors.
+POST_SHAPE_STUB = """\
+def sibling_refs(html):
+    return []
+
+
+def shown_outside_code(html):
+    return []
+"""
+
+
+def plant_post_shape(repo: Path, body: str = POST_SHAPE_STUB) -> Path:
+    """Write a post-shape library into a fixture site repo; returns its path."""
+    scripts = repo / "scripts"
+    scripts.mkdir(exist_ok=True)
+    target = scripts / "post_shape.py"
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
 @pytest.fixture
 def site(monkeypatch):
     """A stable fake origin for the live site."""
@@ -102,6 +132,7 @@ def blog(tmp_path, monkeypatch, site):
     _init_repo(repo)
     (repo / "blog").mkdir()
     (repo / "README.md").write_text("fixture blog\n", encoding="utf-8")
+    plant_post_shape(repo)
     _run(["git", "add", "-A"], repo)
     _run(["git", "commit", "-qm", "init"], repo)
     _run(["git", "remote", "add", "origin", str(remote)], repo)
