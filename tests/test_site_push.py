@@ -365,3 +365,33 @@ def test_untracked_files_are_never_a_reason_to_refuse_or_a_casualty(
         assert result.get("checkout_warning"), "a staged file should hold the fast-forward"
     else:
         assert not result.get("checkout_warning"), "an untracked file should not hold it"
+
+
+def test_a_crlf_checkout_does_not_republish_an_unchanged_post(
+        blog, blog_remote, site, srv):
+    """core.autocrlf=true is the normal Windows/Git Bash setup, and this operator
+    works there. The working tree then holds CRLF while the blob on main holds LF,
+    so a hash taken over the raw bytes compares two things git never claimed were
+    equal: git reports the tree clean and the comparison reports a change.
+
+    Measured on 2026-09-20 before the fix — `hash-object --no-filters` mismatched
+    main on a faithful Windows-style clone. The consequence was not a refusal but
+    churn: every unchanged post republished, each publish committing CRLF over the
+    whole file and triggering both derivative Actions.
+    """
+    write_post(blog, "ready", site)
+    assert srv.commit_and_push("ready")["ok"] is True
+    published = _git(blog_remote, "rev-parse", "main:blog/ready/index.html").strip()
+
+    # The same post as a Windows checkout holds it: identical content, CRLF endings.
+    _git(blog, "config", "core.autocrlf", "true")
+    path = blog / "blog" / "ready" / "index.html"
+    path.write_bytes(path.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+
+    result = srv.commit_and_push("ready")
+
+    assert result["ok"] is True, result
+    assert result["committed"] is False, "a line-ending-only difference was read as an edit"
+    assert "nothing to commit" in result["reason"]
+    assert _git(blog_remote, "rev-parse", "main:blog/ready/index.html").strip() == published, \
+        "main's blob was rewritten by a publish that had nothing to publish"
