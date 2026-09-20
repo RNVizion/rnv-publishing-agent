@@ -153,6 +153,19 @@ def main() -> int:
     (blog / "blog").mkdir()
     (blog / "assets" / "og").mkdir(parents=True)
     (blog / "README.md").write_text("demo blog\n", encoding="utf-8")
+    # validate_post imports the site project's post-shape library out of the site
+    # checkout, and this demo builds its own, so it has to carry one. A real site
+    # repo has held scripts/post_shape.py since 2026-09-20; without it the agent
+    # correctly refuses to publish, which is what this demo hit the first time it
+    # ran after the check landed.
+    #
+    # It answers "nothing beside the post", which is true of every post this demo
+    # writes. The real library's parsing is tested where it lives, against its own
+    # vectors; what the demo needs is a truthful answer, not a second parser.
+    (blog / "scripts").mkdir()
+    (blog / "scripts" / "post_shape.py").write_text(
+        "def sibling_refs(html):\n    return []\n\n\n"
+        "def shown_outside_code(html):\n    return []\n", encoding="utf-8")
     # Wave two: build-feed regenerates this after the push, so at first it lists only
     # what was already published.
     (blog / "sitemap.xml").write_text(SITEMAP.format(urls=""), encoding="utf-8")
