@@ -5,6 +5,7 @@ import json
 import time
 import subprocess
 import tempfile
+import importlib.util
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -271,6 +272,83 @@ def list_posts() -> list[dict]:
         posts.append({"slug": slug, "title": title, "published": date})
     return posts
 
+# ---------------------------------------------------------------------------
+# The post-shape library, owned by the site project.
+#
+# Defined in `scripts/post_shape.py` in rnvizion.github.io, which states its own
+# public interface: sibling_refs(html) and shown_outside_code(html), each taking an
+# HTML string and returning a list of strings, and touching no filesystem, git or
+# network. This repo IMPORTS it rather than reimplementing it, on the site project's
+# ruling of 2026-09-20 and its own standing pattern: a second consumer imports the
+# existing generator, it does not grow its own copy. A copy of a parser is the same
+# defect as a second renderer, one layer down — and the rule moved twice in three
+# days, so a copy would have drifted before it was a week old. Under import there is
+# nothing to keep in sync, which is why the shared-vector scheme was retired.
+#
+# WHY BY EXPLICIT PATH RATHER THAN sys.path
+#   Nothing is added to the import namespace, so a module in the site's scripts/ can
+#   never shadow one of ours, and the path that was tried is reportable when it
+#   fails. The same reasoning that keeps the agent from mutating sys.path to find its
+#   own config: a search path is a guess, a resolved path is a fact.
+#
+# WHY IT IS RE-READ ON EVERY CALL
+#   The operator pulls the site checkout between publishes. A module cached at first
+#   use would keep asserting the rule as it stood when the server started, which is
+#   the stale-cache failure this project has now fixed twice elsewhere.
+POST_SHAPE_PATH = ("scripts", "post_shape.py")
+POST_SHAPE_INTERFACE = ("sibling_refs", "shown_outside_code")
+
+
+def _load_post_shape():
+    """Import the site project's post-shape library.
+
+    Returns the module. Raises RuntimeError naming the path when it is absent, will
+    not import, or no longer offers the interface it declares — never a bare
+    exception, because the caller has to tell a library problem from a post problem.
+    """
+    path = blog_repo().joinpath(*POST_SHAPE_PATH)
+    if not path.is_file():
+        raise RuntimeError(
+            f"the site project's post-shape library is not at {path}; a checkout "
+            f"predating 2026-09-20 does not carry it — pull the site repo")
+
+    spec = importlib.util.spec_from_file_location("rnv_site_post_shape", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{path} could not be loaded as a Python module")
+    module = importlib.util.module_from_spec(spec)
+    # Import without leaving a .pyc behind. Python caches bytecode next to the
+    # source, so importing this would write scripts/__pycache__/ into the
+    # OPERATOR'S site checkout — a publish is not entitled to create files in
+    # somebody else's repo, even ignored ones, and the site project had to add a
+    # .gitignore line for exactly this. Found by a test asserting the checkout was
+    # clean after a publish, which it then was not.
+    wrote_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        # BaseException rather than Exception, and that is the whole point of this
+        # clause. The failure it catches is a module that calls sys.exit() while
+        # being imported, which raises SystemExit — not an Exception subclass — and
+        # would otherwise end the publish with no result and no explanation. Not
+        # hypothetical: importing the site's tests/test_post_shape.py did exactly
+        # that, and it exited over a defect in a DIFFERENT post than the one being
+        # published. The library is written not to, and its own CI pins that in a
+        # subprocess; this is the half that does not depend on their CI having run.
+        raise RuntimeError(
+            f"{path} raised while being imported ({type(exc).__name__}: {exc})") from exc
+    finally:
+        sys.dont_write_bytecode = wrote_bytecode
+
+    missing = [name for name in POST_SHAPE_INTERFACE
+               if not callable(getattr(module, name, None))]
+    if missing:
+        raise RuntimeError(
+            f"{path} does not define {', '.join(missing)}; the library's public "
+            f"interface has moved and this repo's call has to move with it")
+    return module
+
+
 @mcp.tool()
 def validate_post(slug: str) -> dict:
     """Check a post has everything the feed needs before publishing.
@@ -286,6 +364,27 @@ def validate_post(slug: str) -> dict:
     # Checked on the RAW html: _strip_comments exists so commented-out metadata does
     # not count as present, which is the opposite of what this needs to see.
     strays = stray_comments(raw)
+
+    # The site project's rule, asked of the site project's library rather than
+    # reimplemented here. `raw` is passed unmodified: sibling_refs does its own
+    # comment stripping, <code>/<pre> cutting and escaped-markup neutralising, and
+    # handing it something already normalised would be this repo deciding what the
+    # rule means.
+    try:
+        siblings = _load_post_shape().sibling_refs(raw)
+    except RuntimeError as exc:
+        # Structurally a config failure, not a post failure: the post may be
+        # perfect and we could not ask. Reporting ok here would be the green
+        # result that did not look, and reporting it as a post defect would send
+        # the author to fix a file that is fine.
+        return {"slug": slug, "ok": False, "error": "config", "problems": [str(exc)]}
+
+    # shown_outside_code() is deliberately not called. The wrapper rule is the site
+    # project's, and a wrapper mistake breaks nothing a publish carries — their
+    # build-feed guard catches it, and refusing there costs nobody a live post. The
+    # library keeps it a separate function precisely so that skipping it is a
+    # decision rather than an oversight; this comment is the decision.
+
     required = {
         "<article> block": bool(re.search(r"<article[^>]*>.*?</article>", body, flags=re.S)),
         "og:url": bool(_meta(body, "property", "og:url")),
@@ -302,13 +401,22 @@ def validate_post(slug: str) -> dict:
     missing_recommended = [k for k, ok in recommended.items() if not ok]
     out = {
         "slug": slug,
-        "ok": not missing_required and not strays,
+        "ok": not missing_required and not strays and not siblings,
         "missing_required": missing_required,
         "missing_recommended": missing_recommended,
     }
     if strays:
         out["stray_comments"] = strays
         out["error"] = "comment"
+    # Gating, not warning, under §3.0.5: does waiting fix it? No workflow writes
+    # under blog/<slug>/ — build-feed stages feed.xml, blog/index.html, sitemap.xml
+    # and robots.txt, build-og stages assets/ — so nothing will ever arrive to
+    # satisfy a reference that resolves beside the post. It is the post's own
+    # defect, and a publish carries one path. The og:image is the queue case and is
+    # absolute, which is why the library does not return it.
+    if siblings:
+        out["sibling_refs"] = siblings
+        out["error"] = "sibling"
     return out
 
 # The site repo's branch. Pages serves it and both generator Actions trigger on it,
