@@ -23,10 +23,18 @@ DELIBERATELY STDLIB-ONLY. It must run BEFORE `pip install -r requirements.txt`,
 so it can tell you that is what you still need to do. Importing mcp here would
 make the dependency check impossible to fail usefully.
 
-USAGE (from the agent repo root)
+USAGE (from anywhere)
   python tools/preflight.py                      # environment only
   python tools/preflight.py --slug my-post       # also check a specific post
   python tools/preflight.py --slug my-post --push-check   # also verify push access
+
+  The working directory does not matter. Every path is resolved from this
+  file's own location, the same derivation rnv_config uses, so the script can be
+  wired into a job that cannot change directory. This block said "from the agent
+  repo root" until 2026-09-22, having survived the commit that removed the last
+  cwd dependency — a constraint a reader obeys is never contradicted by the code,
+  so it costs nothing until someone reads it and concludes the tool is
+  unavailable where they need it.
 
 EXIT CODES
   0  ready
@@ -112,18 +120,25 @@ def check_dependencies() -> None:
              "pip install -r requirements.txt")
     else:
         line(OK, "mcp importable")
+    # Reports the package and nothing about whether agent.py can run. That
+    # verdict needs the key too, and it belongs to check_agent_route — see the
+    # note there. Until 2026-09-22 this line asserted it from half the condition.
     if importlib.util.find_spec("anthropic") is None:
-        warn("anthropic not importable", "agent.py unavailable",
-             "only needed for the conversational route; the direct route is fine")
+        warn("anthropic not importable", "needed by agent.py",
+             "only the conversational route needs it; the direct route is fine")
     else:
-        line(OK, "anthropic importable", "(only needed by agent.py)")
+        line(OK, "anthropic importable", "(needed by agent.py)")
 
 
 def check_agent_repo(repo_root: Path) -> None:
     server = repo_root / "server.py"
     if not server.is_file():
+        # repo_root comes from __file__, so no working directory can produce
+        # this. The only way here is a copy of preflight.py living outside the
+        # repo, and changing directory does not fix that.
         fail("server.py not found", f"looked in {repo_root}",
-             "run this from the agent repo, not the site checkout")
+             "preflight.py resolves the repo from its own location; run the copy "
+             "inside the agent repo's tools/, not one moved elsewhere")
     else:
         line(OK, "agent repo located", str(repo_root))
 
@@ -253,12 +268,41 @@ def check_post(paths: dict[str, Path | None], slug: str) -> None:
 
 
 def check_agent_route() -> None:
+    """The one place that decides whether agent.py can run.
+
+    agent.py needs BOTH the anthropic package and ANTHROPIC_API_KEY. Until
+    2026-09-22 two checks each owned half of that condition and each asserted the
+    whole verdict: check_dependencies said "agent.py unavailable" from the import
+    alone, this said "agent.py available" from the key alone. With the package
+    missing and the key set, one run printed both — and the wrong one printed
+    last, so it is the one a reader carries away.
+
+    The failure direction was the bad one. A missing key with the package present
+    warned, which is conservative. A present key with the package missing read
+    `ok`, a false all-clear about the one route this section exists to assess.
+
+    So the verdict has one owner, it reads both inputs, and it names which one
+    failed. Both inputs are read here rather than handed in: the duplicated read
+    is of a fact, not of a judgement, and a signature that threads it through
+    would make the two functions agree by construction at the cost of letting a
+    caller supply the answer. §3.2.4, in the file whose own docstring is about a
+    tool reporting a defect in the wrong place.
+    """
     print("\nAgent route (optional)")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        line(OK, "ANTHROPIC_API_KEY set", "agent.py available")
-    else:
-        warn("ANTHROPIC_API_KEY unset", "agent.py unavailable",
-             "not required: the direct route needs no key")
+    have_package = importlib.util.find_spec("anthropic") is not None
+    have_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    if have_package and have_key:
+        line(OK, "agent.py available", "anthropic importable, ANTHROPIC_API_KEY set")
+        return
+
+    missing = []
+    if not have_package:
+        missing.append("anthropic not importable")
+    if not have_key:
+        missing.append("ANTHROPIC_API_KEY unset")
+    warn("agent.py unavailable", "; ".join(missing),
+         "not required: the direct route needs neither")
 
 
 # --------------------------------------------------------------------------
