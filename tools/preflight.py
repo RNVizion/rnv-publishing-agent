@@ -210,8 +210,15 @@ def check_git(paths: dict[str, Path | None], push_check: bool) -> None:
         if branch == "main":
             line(OK, "on branch main")
         else:
+            # Said "commit_and_push pushes the current branch" until
+            # 2026-09-22. That was written on 09-13 and stopped being true on
+            # 09-18, when the publish began building its commit on main and
+            # pushing <sha>:refs/heads/main regardless of where you stand. The
+            # branch you are on no longer affects WHAT is published; it affects
+            # only whether your checkout gets fast-forwarded onto it afterwards.
             warn("not on main", f"on {branch}",
-                 "commit_and_push pushes the current branch")
+                 "the publish still goes to main — it builds its commit there. "
+                 "Your checkout just will not be moved onto it afterwards")
 
     code, out = run(["git", "status", "--porcelain"], cwd=blog)
     if code == 0 and out:
@@ -222,12 +229,77 @@ def check_git(paths: dict[str, Path | None], push_check: bool) -> None:
         line(OK, "working tree clean")
 
     if push_check:
-        code, out = run(["git", "push", "--dry-run"], cwd=blog)
+        # ASK THE QUESTION YOU MEAN. Until 2026-09-22 this ran a bare
+        # `git push --dry-run`, which pushes the current branch to its upstream
+        # and therefore fails whenever the remote has moved. The site's own
+        # Actions push to main on every publish, so "the remote moved" is this
+        # pipeline's normal steady state, not an edge case — and commit_and_push
+        # handles it by design, deciding against main and rebuilding its commit
+        # there. So the old check reported NOT READY for a publish that would
+        # have succeeded, and captioned it "configure credentials", which was
+        # the 2026-09-18 defect (a permission hint on every push failure) living
+        # on in a second file after server.py was fixed.
+        #
+        # A dry-run push of a NEW ref asks only what this check means: may I
+        # write to this remote? A ref that does not exist cannot diverge, so
+        # nothing about main's position can make it fail, and creating a branch
+        # is a real write, so a remote that refuses writes still says no.
+        # --dry-run leaves nothing behind; verified against a live remote.
+        #
+        # Classifying the old error instead would have needed server.py's
+        # _REMOTE_MOVED and _PERMISSION_MARKERS, and preflight cannot import
+        # server.py (it needs mcp, and this script runs before pip install).
+        # Copying them here would be a second definition of a rule — principle
+        # 18. Changing the instrument needs neither copy.
+        probe = "refs/heads/__rnv_preflight_probe__"
+        code, out = run(["git", "push", "--dry-run", "origin", f"HEAD:{probe}"],
+                        cwd=blog)
         if code == 0:
-            line(OK, "push access confirmed", "(dry run)")
+            line(OK, "push access confirmed", "(dry run; no ref created)")
         else:
-            fail("cannot push to the site repo", out.splitlines()[-1] if out else "",
-                 "configure credentials; a Codespace grants this natively, a laptop does not")
+            # git's own words, first line first: its last line is usually a
+            # `hint:` pointing at documentation rather than the error.
+            said = [l for l in out.splitlines() if l.strip()]
+            fail("cannot write to the site repo", said[0] if said else "",
+                 "git's message is above. Credentials are the usual cause — a "
+                 "Codespace grants them natively, a laptop does not — but read "
+                 "it rather than assuming: this check no longer guesses")
+
+
+def post_shape_refs(blog: Path, html: str) -> list[str] | None:
+    """Ask the site project's own library what resolves beside the post.
+
+    Returns the references, [] if none, or None when the library could not be
+    used — which is a gap in this check, never a verdict about the post.
+
+    IMPORTED, NOT REIMPLEMENTED — principle 18, and the same module validate_post
+    loads, so the two cannot disagree about the rule. What is local here is the
+    loading mechanism, not the rule; a path-import helper is not a second
+    definition of what a sibling reference is. The library is stdlib-only, so
+    this costs preflight nothing of its run-before-pip-install property.
+    """
+    path = blog / "scripts" / "post_shape.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("rnv_preflight_post_shape", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # No .pyc in the operator's site checkout: a preflight is not entitled to
+    # create files in somebody else's repo. Same reasoning as server.py's loader.
+    wrote = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+        refs = module.sibling_refs(html)
+    except BaseException:
+        # BaseException, not Exception: a library that calls sys.exit() on import
+        # raises SystemExit, which is not an Exception, and must not end a
+        # diagnostic run. Same reasoning as server.py's loader.
+        return None
+    finally:
+        sys.dont_write_bytecode = wrote
+    return list(refs) if refs is not None else None
 
 
 def check_post(paths: dict[str, Path | None], slug: str) -> None:
@@ -265,6 +337,32 @@ def check_post(paths: dict[str, Path | None], slug: str) -> None:
         found = set(re.findall(r"\[[A-Z][^\]]*\]", stripped))
         warn("unfilled template placeholders", ", ".join(sorted(found)[:4]),
              "these would publish verbatim")
+
+    # The post-shape rule, asked of the site project's own library. validate_post
+    # GATES on this, so a post failing it does not publish; before 2026-09-22
+    # preflight said READY about such a post and printed the publish command.
+    refs = post_shape_refs(blog, html)
+    if refs is None:
+        warn("post-shape rule not checked",
+             f"no usable {blog / 'scripts' / 'post_shape.py'}",
+             "a site checkout predating 2026-09-20 has no library: "
+             'git -C "$BLOG_REPO" pull. validate_post will still gate on it')
+    elif refs:
+        fail("references resolve beside the post", ", ".join(sorted(refs)[:4]),
+             "validate_post halts here. A publish carries only index.html, so "
+             "these would 404 — move them under /assets/ and link absolutely, "
+             "or wrap markup meant to be read in <code>/<pre>")
+    else:
+        line(OK, "no references resolve beside the post")
+
+    # WHAT THIS DID NOT CHECK. validate_post also gates on the site contract's
+    # HTML-comment allowlist, which lives in server.py — unimportable here,
+    # because it needs mcp and this script runs before pip install. Copying the
+    # allowlist would be a second definition of somebody else's rule, so the
+    # honest move is to name the gap rather than close it badly or stay silent
+    # about it. Principle 10: when a tool cannot check something, it says so.
+    print("         not checked here: the HTML-comment allowlist "
+          "(validate_post gates on it; the dry run is the authority)")
 
 
 def check_agent_route() -> None:
@@ -327,15 +425,34 @@ def main() -> int:
     check_agent_route()
 
     print("\n" + "-" * 60)
+    # Whichever verdict follows, a run that looked at a post says who the
+    # authority on that post is. This sat inside the READY branch for the first
+    # hour of its life, so a run that went NOT READY for an unrelated reason —
+    # an unresolved CORPUS_REPO, say — said nothing about scope at all, which is
+    # exactly when someone is iterating and most likely to read the banner as the
+    # whole story. Caught by its own test; the fix was the code, not the test.
+    scope_note = ("           validate_post is the authority on the post; "
+                  "the rehearsal below runs it." if args.slug else "")
+
     if problems:
         print(f"NOT READY — {len(problems)} problem(s): {', '.join(problems)}")
         print("Fix the FAIL lines above, then run this again.")
+        if scope_note:
+            print(scope_note)
         return 1
+    scope = "the machine is ready" if not args.slug else \
+            "the machine is ready, and the post passed every check made here"
     if warnings:
-        print(f"READY — with {len(warnings)} warning(s): {', '.join(warnings)}")
+        print(f"READY — {scope}, with {len(warnings)} warning(s): "
+              f"{', '.join(warnings)}")
     else:
-        print("READY — every check passed.")
+        print(f"READY — {scope}.")
     if args.slug:
+        # Said "READY — every check passed" until 2026-09-22, about a post it had
+        # only partly checked: it cleared one carrying a stray comment and a
+        # sibling reference that validate_post refuses. A banner is a claim about
+        # scope as much as about outcome.
+        print(scope_note)
         print(f"\nRehearse:  python -c \"import server, json; "
               f"print(json.dumps(server.publish_post('{args.slug}'), indent=2))\"")
         print(f"Publish :  python -c \"import server, json; "
