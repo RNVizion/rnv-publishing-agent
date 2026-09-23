@@ -24,7 +24,7 @@ mcp = FastMCP("rnv-publishing")
 # three repos are cloned next to each other, and that relationship holds on every
 # machine even when the absolute path does not. It retires the hardcoded /workspaces
 # defaults, which were correct only in a Codespace and silently wrong everywhere else.
-from rnv_config import resolve_path, resolve_site_url, describe
+from rnv_config import resolve_path, resolve_site_url, describe, dotenv_problems
 
 
 def blog_repo() -> Path:
@@ -137,6 +137,14 @@ def config_report(for_real: bool = False) -> dict:
     """
     problems: list[str] = []
     warnings: list[str] = []
+
+    # A .env line that could not be used is reported and never gates. It does not
+    # mean the resolution is wrong — the sibling rung may well be right — only that
+    # an answer the operator thought they configured was not the one used. The
+    # path checks below gate on what the run actually needs; this explains a
+    # surprise rather than causing one. §3.0.5: gate a defect, warn about the rest.
+    warnings.extend(f"{m} — resolution fell through to the next rung"
+                    for m in dotenv_problems())
 
     blog = _path_problem("BLOG_REPO")
     if blog:
