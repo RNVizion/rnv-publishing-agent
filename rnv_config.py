@@ -58,43 +58,124 @@ DEFAULT_SITE_URL = "https://rnvizion.dev"
 _LINE = re.compile(r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$""")
 
 
-def parse_dotenv(text: str) -> dict[str, str]:
-    """Parse a .env file. Hand-rolled on purpose: the alternative is a runtime
-    dependency for twenty lines, in a repo that just removed two unused ones and
-    parses HTML with `re` by choice.
+def _parse_dotenv(text: str) -> tuple[dict[str, str], list[str]]:
+    """Parse a .env file. Returns (values, problems).
+
+    Hand-rolled on purpose: the alternative is a runtime dependency for twenty
+    lines, in a repo that removed two unused ones and parses HTML with `re` by
+    choice.
 
     Handles: comments, blank lines, an optional `export ` prefix, and single or
     double quoted values. Quoting matters more than it looks — a Windows path can
     contain spaces, and an unquoted parser would truncate
     C:/Users/John Smith/rnv/... at the space.
+
+    EVERY SKIPPED LINE IS REPORTED, and that is the fix underneath the three
+    defects of 2026-09-22 rather than one of them. Until then this loop `continue`d
+    past anything it did not understand, so a .env the operator had written and a
+    .env that had been silently discarded produced identical output — resolution
+    fell to the sibling rung and reported *that* rung honestly, which is the worst
+    possible combination: a confident provenance for an answer the operator did not
+    configure. Principle 6, in the one file whose whole job is to say where a value
+    came from.
+
+    THE QUOTED-VALUE BUG, kept as a comment because the old shape looks right.
+    It asked `value[0] == value[-1]` of the WHOLE remainder, comment included. With
+    `BLOG_REPO="/real/site"   # my checkout` the last character is `t`, so the
+    quoted branch was not taken, the else-branch stripped the comment, and the
+    quotes survived into the value. `Path('"/real/site"')` is not absolute, so it
+    was joined onto the agent repo and reported as *"relative to the agent repo"* —
+    an absolute path the operator wrote, described back to them as a relative one
+    they did not. `.env.example` quotes every example assignment and tells you to
+    quote paths with spaces, so uncommenting one and adding a note is the natural
+    gesture. A value is now quoted if it STARTS with a quote; the matching close
+    ends it and anything after is a comment.
+
+    Escapes are deliberately not supported — no \" inside a double-quoted value —
+    and never were. A path needing one has bigger problems; say so rather than
+    half-implementing it.
     """
-    out: dict[str, str] = {}
-    for raw in text.splitlines():
+    values: dict[str, str] = {}
+    problems: list[str] = []
+    for n, raw in enumerate(text.splitlines(), 1):
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         m = _LINE.match(raw)
         if not m:
+            problems.append(f"line {n} is not KEY=value and was ignored: "
+                            f"{raw.strip()[:40]!r}")
             continue
         key, value = m.group(1), m.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]          # quoted: take it verbatim
+        if value[:1] in ("'", '"'):
+            quote = value[0]
+            close = value.find(quote, 1)
+            if close == -1:
+                problems.append(f"line {n} ({key}) opens a {quote} and never closes "
+                                f"it; the line was ignored")
+                continue
+            value = value[1:close]
         else:
             value = value.split(" #", 1)[0].strip()   # unquoted: trailing comment
-        if value:
-            out[key] = value
-    return out
+        if not value:
+            problems.append(f"line {n} ({key}) has an empty value and was ignored")
+            continue
+        values[key] = value
+    return values, problems
+
+
+def parse_dotenv(text: str) -> dict[str, str]:
+    """The values only. `dotenv_problems()` reports what was skipped."""
+    return _parse_dotenv(text)[0]
+
+
+def _read_dotenv() -> tuple[dict[str, str], list[str]]:
+    """Read and parse DOTENV_PATH. Returns (values, problems); never raises.
+
+    Read per call rather than cached: the file is tiny, the call count is a handful
+    per publish, and a cache would make the module's behaviour depend on import
+    order during tests.
+
+    `utf-8-sig` rather than `utf-8`, and it is load-bearing on this operator's
+    platform. A UTF-8 BOM is not whitespace to `re` and is not removed by `strip()`,
+    so with plain utf-8 the FIRST assignment failed the line regex and was dropped
+    while every later line parsed — a .env that half-works, which is the worst shape
+    for diagnosis. Notepad and VS Code both offer "UTF-8 with BOM". `utf-8-sig`
+    strips a BOM when present and is a no-op when it is not.
+
+    UnicodeDecodeError is caught explicitly because it subclasses ValueError, NOT
+    OSError, so the old `except OSError` did not catch it and it escaped through
+    the public API — killing `tools/preflight.py`, the stdlib-only diagnostic whose
+    entire job is to name the cause, with a traceback instead of a diagnosis.
+    PowerShell's `>` and `Out-File` write UTF-16 by default, so this is one
+    redirect away on the platform the operator publishes from.
+    """
+    try:
+        if not DOTENV_PATH.is_file():
+            return {}, []
+        text = DOTENV_PATH.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as e:
+        return {}, [f"{DOTENV_PATH} is not UTF-8 ({e.reason}) and was ignored "
+                    f"entirely; PowerShell's > and Out-File write UTF-16 — re-save "
+                    f"it as UTF-8"]
+    except OSError as e:
+        return {}, [f"{DOTENV_PATH} could not be read ({e.strerror or e}) and was "
+                    f"ignored entirely"]
+    return _parse_dotenv(text)
 
 
 def dotenv_values() -> dict[str, str]:
-    """Read DOTENV_PATH, or {} if it isn't there. Read per call rather than cached:
-    the file is tiny, the call count is a handful per publish, and a cache would
-    make the module's behaviour depend on import order during tests."""
-    try:
-        if DOTENV_PATH.is_file():
-            return parse_dotenv(DOTENV_PATH.read_text(encoding="utf-8"))
-    except OSError:
-        pass
-    return {}
+    """What the .env configures. {} if it is absent, unreadable, or empty."""
+    return _read_dotenv()[0]
+
+
+def dotenv_problems() -> list[str]:
+    """What the .env said that could not be used, in the operator's own words.
+
+    A separate function rather than a second return value, because every caller of
+    dotenv_values() wants the values and exactly one caller wants this. It re-reads,
+    which costs nothing the per-call decision above has not already accepted.
+    """
+    return _read_dotenv()[1]
 
 
 def _raw(var: str) -> tuple[str | None, str]:
@@ -140,6 +221,13 @@ def describe() -> dict[str, dict[str, str]]:
         out[var] = {"value": str(path), "from": how, "exists": str(path.is_dir())}
     url, how = resolve_site_url()
     out["SITE_URL"] = {"value": url, "from": how, "exists": "n/a"}
+    # Anything the .env said that could not be used. Carried here so it travels
+    # with the resolution rather than needing its own call: a wrong value and the
+    # reason it is wrong belong in the same report.
+    problems = dotenv_problems()
+    if problems:
+        out[".env"] = {"value": str(DOTENV_PATH), "from": "unusable content",
+                       "exists": "; ".join(problems)}
     return out
 
 
