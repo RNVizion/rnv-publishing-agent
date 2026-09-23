@@ -1,5 +1,6 @@
 """The publish chain end to end, including the one place it is deliberately lenient."""
 import json
+import re
 import subprocess
 
 from conftest import git_log, sitemap_xml, write_post
@@ -393,3 +394,128 @@ def test_the_corpus_push_catches_up_too(blog, blog_remote, corpus, site, srv,
     corpus_subjects = _remote_log(tmp_path / "corpus-remote.git")
     assert "corpus: add ready" in corpus_subjects, "the corpus entry never reached the remote"
     assert rebuild in corpus_subjects, "the catch-up discarded the rebuild commit"
+
+
+# ==========================================================================
+# The three wait_for_live findings of 2026-09-23. Each reproduced against
+# `fd3f03f` before anything changed.
+#
+# The unifying defect is that this tool reported on the post's metadata without
+# having read the post, and on the site without having checked its own config. It
+# is the tool whose docstring names the gap it still had: "surfaced loudly as
+# og_image_live=False so a broken share card never passes silently — the exact gap
+# that shipped three imageless posts before."
+
+def strip_og_image(path):
+    path.write_text(re.sub(r'\s*<meta property="og:image"[^>]*>', "",
+                           path.read_text(encoding="utf-8")), encoding="utf-8")
+    return path
+
+
+def live_and_listed(fake_web, site, slug):
+    fake_web[f"{site}/blog/{slug}/"] = 200
+    fake_web[f"{site}/sitemap.xml"] = (200, sitemap_xml(site, slug))
+
+
+def test_a_post_declaring_no_image_does_not_pass_silently(blog, blog_remote, corpus,
+                                                          site, srv, fake_web):
+    """The reproduction, and it is the state the docstring names. publish_post
+    promoted the advisory on `og_image_live is False`; a post declaring no image
+    sets None, so the warning was built and then dropped. The publish returned ok
+    with no warnings key at all."""
+    strip_og_image(write_post(blog, "imageless", site))
+    live_and_listed(fake_web, site, "imageless")
+
+    result = srv.publish_post("imageless", for_real=True)
+
+    assert result["ok"] is True, "a missing image must not fail the publish"
+    assert result.get("warnings"), "the publish reported nothing at all"
+    assert any("no og:image" in w for w in result["warnings"]), result["warnings"]
+
+
+def test_looked_and_found_none_is_not_could_not_look(blog, corpus, site, srv, fake_web):
+    """Two states the old message collapsed into one sentence. They send the reader
+    to different files, so they are reported differently and `og_image_checked`
+    says which happened."""
+    strip_og_image(write_post(blog, "imageless", site))
+    live_and_listed(fake_web, site, "imageless")
+
+    looked = srv.wait_for_live("imageless", timeout=3, og_timeout=3, sitemap_timeout=3)
+
+    assert looked["og_image_checked"] is True
+    assert "declares no og:image" in looked["og_image_warning"]
+
+
+def test_a_post_this_checkout_cannot_read_is_not_claimed_to_declare_nothing(
+        blog, corpus, site, srv, fake_web):
+    """The second finding. The page is live — published from another machine, say —
+    and this checkout has no copy, so the tool asserted the post's metadata about a
+    file it never opened. validate_post, asked about the same slug, says `no
+    index.html`. Principle 10: say which question could not be asked."""
+    write_post(blog, "real", site)
+    live_and_listed(fake_web, site, "ghost")
+
+    result = srv.wait_for_live("ghost", timeout=3, og_timeout=3, sitemap_timeout=3)
+
+    assert result["ok"] is True, "the page is live; this is advisory only"
+    assert result["og_image_checked"] is False
+    assert "was not checked" in result["og_image_warning"], result["og_image_warning"]
+    assert "declares no og:image" not in result["og_image_warning"], \
+        "it still claims the post declares nothing"
+
+
+def test_an_unresolvable_blog_repo_is_named_as_the_reason(blog, corpus, site, srv,
+                                                          fake_web, monkeypatch, tmp_path):
+    """Same shape one rung up, and the message carries the provenance because half a
+    diagnosis is which rung the path came from."""
+    live_and_listed(fake_web, site, "real")
+    write_post(blog, "real", site)
+    monkeypatch.setenv("BLOG_REPO", str(tmp_path / "nowhere-at-all"))
+
+    result = srv.wait_for_live("real", timeout=3, og_timeout=3, sitemap_timeout=3)
+
+    assert result["ok"] is True, "BLOG_REPO is not what this tool needs to do its job"
+    assert result["og_image_checked"] is False
+    assert "BLOG_REPO" in result["og_image_warning"] and \
+           "source: environment" in result["og_image_warning"], result["og_image_warning"]
+
+
+def test_a_rejected_site_url_reports_as_config_not_as_a_dead_page(blog, corpus, srv,
+                                                                  monkeypatch):
+    """The third finding. This was the one tool with no config gate, so a SITE_URL
+    config_report explicitly rejects produced `not live after Ns` — blaming the site
+    for a value that never formed a URL. Principle 16."""
+    monkeypatch.setenv("SITE_URL", "rnvizion.dev")
+
+    result = srv.wait_for_live("anything", timeout=2, og_timeout=2, sitemap_timeout=2)
+
+    assert result["ok"] is False
+    assert result["error"] == "config", result
+    assert "not live" not in json.dumps(result), "it still blames the page"
+
+
+def test_blog_repo_is_deliberately_not_gated_here(blog, corpus, site, srv, fake_web,
+                                                  monkeypatch, tmp_path):
+    """The other half of the gate decision. wait_for_live needs BLOG_REPO only for
+    the advisory image check, so an unresolvable one costs that check and nothing
+    else — the same test the dry/real asymmetry uses. Gating it would turn a live
+    page into a failed verification."""
+    live_and_listed(fake_web, site, "real")
+    write_post(blog, "real", site)
+    monkeypatch.setenv("BLOG_REPO", str(tmp_path / "nowhere-at-all"))
+
+    result = srv.wait_for_live("real", timeout=3, og_timeout=3, sitemap_timeout=3)
+
+    assert result["ok"] is True and result["live"] is True
+    assert result.get("error") != "config"
+
+
+def test_the_site_url_rule_has_one_definition(srv):
+    """The gate and the tool ask the same question because they call the same
+    function. Two copies of a rule are identical only until someone edits one."""
+    import inspect
+    source = inspect.getsource(srv)
+    assert source.count("is not a usable origin") == 1, \
+        "a second copy of the SITE_URL rule appeared"
+    assert source.count("_site_url_problem()") >= 2, \
+        "the shared definition has fewer than two callers"
