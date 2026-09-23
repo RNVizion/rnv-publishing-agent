@@ -128,6 +128,19 @@ def _git_problem(var: str) -> str:
             f"(source: {how})")
 
 
+def _site_url_problem() -> str:
+    """Describe why SITE_URL is unusable, or '' if it is fine.
+
+    Extracted from config_report at rev 16 so wait_for_live can gate on the SAME
+    definition rather than a second one. Two copies of a rule are identical only
+    until someone edits one — the site project's own ruling, one layer down.
+    """
+    url, how = resolve_site_url()
+    if re.match(r"^https?://[^\s/]+\.[^\s/]+", url):
+        return ""
+    return f"SITE_URL is not a usable origin: {url!r} (source: {how})"
+
+
 def config_report(for_real: bool = False) -> dict:
     """Check every path the chain will need, before the chain needs it.
 
@@ -151,9 +164,7 @@ def config_report(for_real: bool = False) -> dict:
         problems.append(blog)
 
     corpus = _path_problem("CORPUS_REPO")
-    url, url_how = resolve_site_url()
-    site = "" if re.match(r"^https?://[^\s/]+\.[^\s/]+", url) else \
-           f"SITE_URL is not a usable origin: {url!r} (source: {url_how})"
+    site = _site_url_problem()
 
     # Only asked when the path itself is sound. Running git inside a directory
     # that does not exist reports "not a git repository" about a path whose real
@@ -773,7 +784,21 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
         passes silently — the exact gap that shipped three imageless posts before.
 
     The image URL is read from the post's own og:image meta, so the check follows
-    whatever the post actually claims rather than a hardcoded path."""
+    whatever the post actually claims rather than a hardcoded path.
+
+    IT GATES ON ITS OWN CONFIG, since rev 16. Until then this was the only tool
+    without one — list_posts and validate_post both have one — so a SITE_URL that
+    config_report explicitly rejects produced `not live after Ns`, which blames the
+    site for a value that never formed a URL. Principle 16: a tool that can be
+    invoked on its own must protect itself, because its caller is not guaranteed to
+    be the composite. BLOG_REPO is deliberately NOT gated here: this tool needs it
+    only for the advisory image check, so an unresolvable one costs that check and
+    nothing else — the same test the dry/real asymmetry uses, can the run honestly
+    do its job without the value."""
+    site_problem = _site_url_problem()
+    if site_problem:
+        return {"slug": slug, "ok": False, "error": "config", "problems": [site_problem]}
+
     url = f"{site_url()}/blog/{slug}/"
     deadline = time.monotonic() + timeout
     last = None
@@ -823,14 +848,55 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
         time.sleep(max(interval, 1))
 
     # Now confirm the og:image the post declares is reachable.
+    #
+    # THREE STATES, NOT TWO, and conflating them was two defects at once.
+    #
+    # Until rev 16 this read the post if it could, and said "post declares no
+    # og:image meta" otherwise — a confident claim about a file it had never
+    # opened. An unresolvable BLOG_REPO and a slug published from another machine
+    # both landed there, so the tool asserted the post's metadata while
+    # validate_post, asked about the same slug, correctly answered `config` or
+    # `no index.html`. Principle 10: when a tool cannot verify something it says
+    # so, rather than guessing between the possibilities.
+    #
+    # The second defect is what the imageless case then did NOT do. The docstring
+    # above promises a missing image "is surfaced loudly ... so a broken share card
+    # never passes silently — the exact gap that shipped three imageless posts
+    # before". publish_post promoted the warning only on og_image_live is False, so
+    # the one state the sentence names — a post declaring no image at all — set
+    # None and was dropped. The publish returned ok with no warnings key.
+    #
+    # og_image_checked separates "we looked and there is none" from "we could not
+    # look", because those send the reader to different files.
+    blog_problem = _path_problem("BLOG_REPO")
     post_path = blog_repo() / "blog" / slug / "index.html"
-    og_image = ""
-    if post_path.exists():
-        og_image = _meta(_strip_comments(post_path.read_text(encoding="utf-8")),
-                         "property", "og:image")
+
+    if blog_problem:
+        result["og_image_live"] = None
+        result["og_image_checked"] = False
+        result["og_image_warning"] = (
+            f"the og:image was not checked, because the post could not be read: "
+            f"{blog_problem}. The page is live; this says nothing about its share card")
+        return result
+
+    if not post_path.is_file():
+        result["og_image_live"] = None
+        result["og_image_checked"] = False
+        result["og_image_warning"] = (
+            f"the og:image was not checked: no post at {post_path}. The page is live, "
+            f"so it was published from somewhere else — this checkout cannot say which "
+            f"image it declares")
+        return result
+
+    og_image = _meta(_strip_comments(post_path.read_text(encoding="utf-8")),
+                     "property", "og:image")
     if not og_image:
         result["og_image_live"] = None
-        result["og_image_warning"] = "post declares no og:image meta — nothing to verify"
+        result["og_image_checked"] = True
+        result["og_image_warning"] = (
+            "post declares no og:image, so a share of it will have no card image. "
+            "og:image is recommended rather than required, so this does not stop the "
+            "publish — but it is the state that shipped three imageless posts")
         return result
 
     result["og_image_url"] = og_image
@@ -1093,8 +1159,13 @@ def publish_post(slug: str, for_real: bool = False, timeout: int = 180,
         return {"slug": slug, "ok": False, "stopped_at": "wait_for_live", "trace": trace}
     if live.get("sitemap_listed") is False:
         warnings.append(live.get("sitemap_warning", "sitemap does not list the post yet"))
-    if live.get("og_image_live") is False:
-        warnings.append(live.get("og_image_warning", "og:image not live yet"))
+    # Driven by the warning's presence, not by one of the values that carries one.
+    # `is False` promoted the lagging-image case and silently dropped both of the
+    # None cases — the post declaring no image, and the post this checkout could
+    # not read. og_image_live is True exactly when there is nothing to say, so this
+    # covers every advisory state including any added later.
+    if live.get("og_image_live") is not True and live.get("og_image_warning"):
+        warnings.append(live["og_image_warning"])
 
     uc = step("update_corpus", update_corpus(slug))
     if not uc.get("ok"):
