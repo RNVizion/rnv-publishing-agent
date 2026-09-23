@@ -177,6 +177,59 @@ def check_environment() -> dict[str, Path | None]:
     return resolved
 
 
+# A ref that does not exist on the remote cannot diverge, so nothing about the
+# remote's position can make a push to it fail; creating a branch is a real write,
+# so a remote that refuses writes still says no. --dry-run leaves nothing behind,
+# and a test asserts the ref is never created.
+PROBE_REF = "refs/heads/__rnv_preflight_probe__"
+
+
+def check_pushable(var: str, repo: Path, push_check: bool) -> None:
+    """Can the chain fetch from and push to this repo? Asked of BOTH of them.
+
+    Until 2026-09-22 only BLOG_REPO was asked anything git-shaped; CORPUS_REPO got
+    resolution and nothing else, so preflight printed READY — and the for_real
+    command under it — for a corpus the registration could not write to. That
+    failure lands at stage 5, with the post already live.
+
+    The local half mirrors server.py's _git_problem and reports git's own words
+    rather than translating them; a caption that names a cause can name the wrong
+    one, which this repo has now fixed twice. The network half runs only under
+    --push-check, which is the whole reason that flag exists.
+
+    ASK THE QUESTION YOU MEAN. Until 2026-09-22 the site half ran a bare
+    `git push --dry-run`, which pushes the current branch to its upstream and so
+    fails whenever the remote has moved. The site's own Actions push to main on
+    every publish, making "the remote moved" this pipeline's normal steady state
+    rather than an edge case — and commit_and_push handles it by design. The old
+    check reported NOT READY for a publish that would have succeeded, and
+    captioned it "configure credentials".
+    """
+    code, out = run(["git", "remote", "get-url", "origin"], cwd=repo)
+    if code != 0:
+        first = (out.splitlines() or [""])[0]
+        fail(f"{var} is not a git repository with an 'origin'", first,
+             f"the chain fetches from and pushes to it. Point {var} at the "
+             f"clone itself, not at a copy of its contents")
+        return
+    line(OK, f"{var} is a git repository", f"origin -> {out.strip()}")
+
+    if not push_check:
+        return
+    code, out = run(["git", "push", "--dry-run", "origin", f"HEAD:{PROBE_REF}"],
+                    cwd=repo)
+    if code == 0:
+        line(OK, f"{var} write access confirmed", "(dry run; no ref created)")
+    else:
+        # git's own words, first line first: its last line is usually a `hint:`
+        # pointing at documentation rather than the error.
+        said = [l for l in out.splitlines() if l.strip()]
+        fail(f"cannot write to {var}", said[0] if said else "",
+             "git's message is above. Credentials are the usual cause — a "
+             "Codespace grants them natively, a laptop does not — but read "
+             "it rather than assuming: this check no longer guesses")
+
+
 def check_git(paths: dict[str, Path | None], push_check: bool) -> None:
     print("\nGit")
     code, out = run(["git", "--version"])
@@ -185,17 +238,30 @@ def check_git(paths: dict[str, Path | None], push_check: bool) -> None:
         return
     line(OK, "git available", out.splitlines()[0] if out else "")
 
+    # Each repo is reported on its own. Until 2026-09-22 an unresolved or non-git
+    # BLOG_REPO returned from this whole function, so CORPUS_REPO was never
+    # reached: one path's problem hid the other's and the operator fixed them one
+    # run at a time. config_report reports every misconfiguration in a single call
+    # for that reason; this now matches it.
     blog = paths.get("BLOG_REPO")
     if blog is None:
-        line(WARN, "skipping repo checks", "BLOG_REPO unresolved")
-        warnings.append("git repo checks skipped")
-        return
+        line(WARN, "skipping site repo checks", "BLOG_REPO unresolved")
+        warnings.append("site repo checks skipped")
+    else:
+        check_site_repo(blog, push_check)
 
+    corpus = paths.get("CORPUS_REPO")
+    if corpus is None:
+        line(WARN, "skipping corpus repo checks", "CORPUS_REPO unresolved")
+        warnings.append("corpus repo checks skipped")
+    else:
+        check_pushable("CORPUS_REPO", corpus, push_check)
+
+
+def check_site_repo(blog: Path, push_check: bool) -> None:
+    check_pushable("BLOG_REPO", blog, push_check)
     if not (blog / ".git").exists():
-        fail("BLOG_REPO is not a git repository", str(blog),
-             "point BLOG_REPO at the cloned site repo, not a plain folder")
         return
-    line(OK, "BLOG_REPO is a git repository")
 
     if not (blog / "blog").is_dir():
         fail("no blog/ directory inside BLOG_REPO", str(blog / "blog"),
@@ -227,43 +293,6 @@ def check_git(paths: dict[str, Path | None], push_check: bool) -> None:
              "commit_and_push stages only the post, but know what else is dirty")
     elif code == 0:
         line(OK, "working tree clean")
-
-    if push_check:
-        # ASK THE QUESTION YOU MEAN. Until 2026-09-22 this ran a bare
-        # `git push --dry-run`, which pushes the current branch to its upstream
-        # and therefore fails whenever the remote has moved. The site's own
-        # Actions push to main on every publish, so "the remote moved" is this
-        # pipeline's normal steady state, not an edge case — and commit_and_push
-        # handles it by design, deciding against main and rebuilding its commit
-        # there. So the old check reported NOT READY for a publish that would
-        # have succeeded, and captioned it "configure credentials", which was
-        # the 2026-09-18 defect (a permission hint on every push failure) living
-        # on in a second file after server.py was fixed.
-        #
-        # A dry-run push of a NEW ref asks only what this check means: may I
-        # write to this remote? A ref that does not exist cannot diverge, so
-        # nothing about main's position can make it fail, and creating a branch
-        # is a real write, so a remote that refuses writes still says no.
-        # --dry-run leaves nothing behind; verified against a live remote.
-        #
-        # Classifying the old error instead would have needed server.py's
-        # _REMOTE_MOVED and _PERMISSION_MARKERS, and preflight cannot import
-        # server.py (it needs mcp, and this script runs before pip install).
-        # Copying them here would be a second definition of a rule — principle
-        # 18. Changing the instrument needs neither copy.
-        probe = "refs/heads/__rnv_preflight_probe__"
-        code, out = run(["git", "push", "--dry-run", "origin", f"HEAD:{probe}"],
-                        cwd=blog)
-        if code == 0:
-            line(OK, "push access confirmed", "(dry run; no ref created)")
-        else:
-            # git's own words, first line first: its last line is usually a
-            # `hint:` pointing at documentation rather than the error.
-            said = [l for l in out.splitlines() if l.strip()]
-            fail("cannot write to the site repo", said[0] if said else "",
-                 "git's message is above. Credentials are the usual cause — a "
-                 "Codespace grants them natively, a laptop does not — but read "
-                 "it rather than assuming: this check no longer guesses")
 
 
 def post_shape_refs(blog: Path, html: str) -> list[str] | None:
