@@ -516,3 +516,35 @@ def test_the_corpus_probe_leaves_no_ref_behind(pf, blog, corpus, tmp_path, capsy
     refs = _run(["git", "for-each-ref", "--format=%(refname)"],
                 tmp_path / "corpus-remote.git").stdout
     assert "preflight_probe" not in refs, refs
+
+
+# --- The .env report, added 2026-09-22 with the parser fix. ----------------
+
+def test_an_unusable_dotenv_line_warns_instead_of_reporting_ok(pf, monkeypatch, tmp_path, capsys):
+    """Until 2026-09-22 a .env whose lines could not be parsed produced a plain
+    `[  ok  ] .env present` while its contents were silently discarded, and the
+    resolution above it reported the sibling rung with a straight face."""
+    import rnv_config
+    path = tmp_path / "planted.env"
+    path.write_text('BLOG_REPO="/a\n', encoding="utf-8")
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", path)
+
+    pf.check_environment()
+
+    out = capsys.readouterr().out
+    assert ".env line unusable" in out, out
+    assert "[  ok  ] .env present" not in out, "it still reported the file as fine"
+    assert pf.warnings, "the discarded line raised nothing at all"
+
+
+def test_a_healthy_dotenv_still_reports_present(pf, monkeypatch, tmp_path, capsys):
+    """The silent half."""
+    import rnv_config
+    path = tmp_path / "planted.env"
+    path.write_text("SITE_URL=https://rnvizion.dev\n", encoding="utf-8")
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", path)
+
+    pf.check_environment()
+
+    out = capsys.readouterr().out
+    assert ".env present" in out and ".env line unusable" not in out, out
