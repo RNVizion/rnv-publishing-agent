@@ -327,11 +327,11 @@ def test_the_shape_rule_is_imported_rather_than_reimplemented():
     assert "def sibling_refs" not in source, "preflight grew its own copy of the rule"
 
 
-def test_the_ready_banner_states_its_scope(blog, site, tmp_path):
+def test_the_ready_banner_states_its_scope(blog, corpus, site, tmp_path):
     """A banner is a claim about scope as much as about outcome."""
     write_post(blog, "probe", site)
     env = {**os.environ, "BLOG_REPO": str(blog), "SITE_URL": site,
-           "CORPUS_REPO": str(tmp_path), "SITE_URL": site}
+           "CORPUS_REPO": str(corpus), "SITE_URL": site}
 
     run = subprocess.run([sys.executable, str(PREFLIGHT), "--slug", "probe"],
                          cwd=tmp_path, capture_output=True, text=True,
@@ -386,7 +386,7 @@ def test_a_remote_that_moved_is_not_reported_as_a_push_failure(pf, blog, blog_re
     pf.check_git(paths_of(blog), push_check=True)
 
     out = capsys.readouterr().out
-    assert "push access confirmed" in out, out
+    assert "BLOG_REPO write access confirmed" in out, out
     assert pf.problems == [], f"a moved remote was reported as a problem: {pf.problems}"
 
 
@@ -397,7 +397,7 @@ def test_an_unreachable_remote_is_still_a_push_failure(pf, blog, capsys):
     pf.check_git(paths_of(blog), push_check=True)
 
     out = capsys.readouterr().out
-    assert "cannot write to the site repo" in out, out
+    assert "cannot write to BLOG_REPO" in out, out
     assert pf.problems, "an unreachable remote passed the push check"
 
 
@@ -424,7 +424,7 @@ def test_the_push_check_leaves_no_ref_on_the_remote(pf, blog, blog_remote, capsy
     assert "preflight_probe" not in refs, f"the probe ref was really created:\n{refs}"
 
 
-def test_the_scope_note_survives_a_not_ready_verdict(blog, site, tmp_path):
+def test_the_scope_note_survives_a_not_ready_verdict(blog, corpus, site, tmp_path):
     """Found by the test above while it was still wrong itself. The scope note
     lived inside the READY branch, so a run failing for an unrelated reason said
     nothing about who the authority on the post is — and that is the run someone
@@ -457,3 +457,62 @@ def test_the_import_leaves_no_bytecode_in_the_operators_checkout(pf, blog, site,
 
     assert not (scripts / "__pycache__").exists(), \
         f"the import wrote into the site checkout: {[p.name for p in scripts.iterdir()]}"
+
+
+# --- The corpus half, added 2026-09-22 with the gate. ---------------------
+# preflight asked BLOG_REPO everything git-shaped and CORPUS_REPO nothing, so it
+# printed READY — and the for_real command under it — for a corpus the
+# registration could not write to. That failure lands at stage 5, post already live.
+
+def both(blog, corpus):
+    return {"BLOG_REPO": blog, "CORPUS_REPO": corpus}
+
+
+def test_a_corpus_that_is_not_a_repo_is_reported(pf, blog, tmp_path, capsys):
+    plain = tmp_path / "corpus-plain"
+    plain.mkdir()
+
+    pf.check_git(both(blog, plain), push_check=False)
+
+    out = capsys.readouterr().out
+    assert "CORPUS_REPO is not a git repository with an 'origin'" in out, out
+    assert pf.problems, "a corpus the chain cannot write to passed preflight"
+
+
+def test_a_healthy_corpus_is_reported_too(pf, blog, corpus, capsys):
+    """The silent half: it says what it found rather than going quiet entirely,
+    but it raises no problem."""
+    pf.check_git(both(blog, corpus), push_check=False)
+
+    out = capsys.readouterr().out
+    assert "CORPUS_REPO is a git repository" in out, out
+    assert pf.problems == []
+
+
+def test_a_bad_blog_repo_no_longer_hides_the_corpus(pf, corpus, tmp_path, capsys):
+    """Until 2026-09-22 an unresolved BLOG_REPO returned from the whole function,
+    so the corpus was never reached and the operator fixed one path per run.
+    config_report reports every misconfiguration in one call; this now matches."""
+    pf.check_git({"BLOG_REPO": None, "CORPUS_REPO": corpus}, push_check=False)
+
+    out = capsys.readouterr().out
+    assert "skipping site repo checks" in out, out
+    assert "CORPUS_REPO is a git repository" in out, \
+        "the site repo's problem still swallows the corpus check"
+
+
+def test_push_check_probes_the_corpus_too(pf, blog, corpus, capsys):
+    pf.check_git(both(blog, corpus), push_check=True)
+
+    out = capsys.readouterr().out
+    assert "CORPUS_REPO write access confirmed" in out, out
+    assert "BLOG_REPO write access confirmed" in out, out
+
+
+def test_the_corpus_probe_leaves_no_ref_behind(pf, blog, corpus, tmp_path, capsys):
+    pf.check_git(both(blog, corpus), push_check=True)
+    capsys.readouterr()
+
+    refs = _run(["git", "for-each-ref", "--format=%(refname)"],
+                tmp_path / "corpus-remote.git").stdout
+    assert "preflight_probe" not in refs, refs
