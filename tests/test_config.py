@@ -420,3 +420,130 @@ def test_the_message_carries_gits_own_words_and_the_provenance(srv, blog, monkey
 
     assert "not a git repository" in problem, problem
     assert "source: environment" in problem, "the provenance half of the diagnosis is missing"
+
+
+# ==========================================================================
+# The three .env findings of 2026-09-22, and the shape underneath them.
+#
+# Each was reproduced against `affd401` before anything changed. The unifying
+# defect is that the parser dropped whatever it did not understand in silence, so
+# a .env the operator wrote and a .env that had been discarded produced identical
+# output — resolution fell to the sibling rung and reported *that* rung honestly.
+# A confident provenance for an answer nobody configured.
+
+def env_file(monkeypatch, tmp_path, content, *, raw=False):
+    path = tmp_path / "planted.env"
+    path.write_bytes(content) if raw else path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(rnv_config, "DOTENV_PATH", path)
+    return path
+
+
+def test_a_quoted_value_with_a_trailing_comment_keeps_its_quotes_off(monkeypatch, tmp_path):
+    """Finding 1, and the worst of the three because it ends in a wrong answer
+    rather than a missing one. The old test asked `value[0] == value[-1]` of the
+    whole remainder, so the comment's last character defeated it, the quotes
+    survived, and `Path('"/real/site"')` is not absolute — the operator's absolute
+    path was joined onto the agent repo and reported back to them as relative."""
+    env_file(monkeypatch, tmp_path, 'BLOG_REPO="/real/site"   # my checkout\n')
+    for var in ("BLOG_REPO", "CORPUS_REPO", "SITE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+    path, how = rnv_config.resolve_path("BLOG_REPO")
+
+    assert str(path) == "/real/site", f"the quotes reached the path: {path}"
+    assert "relative to the agent repo" not in how, \
+        f"an absolute path was reported as relative: {how}"
+
+
+def test_a_utf8_bom_does_not_eat_the_first_assignment(monkeypatch, tmp_path):
+    """Finding 2. A BOM is not whitespace to `re` and `strip()` does not remove it,
+    so under plain utf-8 the FIRST line failed the regex while every later line
+    parsed — a .env that half-works, which is the worst shape for diagnosis.
+    Notepad and VS Code both offer 'UTF-8 with BOM'."""
+    env_file(monkeypatch, tmp_path,
+             '\ufeffBLOG_REPO=/a\nCORPUS_REPO=/b\n'.encode("utf-8"), raw=True)
+
+    assert rnv_config.dotenv_values() == {"BLOG_REPO": "/a", "CORPUS_REPO": "/b"}
+    assert rnv_config.dotenv_problems() == []
+
+
+def test_a_utf16_dotenv_is_reported_rather_than_raised(monkeypatch, tmp_path):
+    """Finding 3. UnicodeDecodeError subclasses ValueError, not OSError, so the old
+    `except OSError` did not catch it and it escaped through the public API —
+    killing tools/preflight.py, the stdlib-only diagnostic whose whole job is to
+    name the cause, with a traceback instead of a diagnosis. PowerShell's `>` and
+    Out-File write UTF-16, so this is one redirect away on Windows."""
+    env_file(monkeypatch, tmp_path, 'BLOG_REPO=/real/site\n'.encode("utf-16"), raw=True)
+
+    assert rnv_config.dotenv_values() == {}, "it used a file it could not decode"
+    problem = rnv_config.dotenv_problems()
+    assert len(problem) == 1 and "not UTF-8" in problem[0], problem
+    assert "UTF-16" in problem[0], "the message does not name the likely cause"
+
+
+@pytest.mark.parametrize("content, expect", [
+    ("BLOG REPO=/a\n", "not KEY=value"),
+    ("BLOG_REPO=\n", "empty value"),
+    ('BLOG_REPO="/a\n', "never closes"),
+])
+def test_every_skipped_line_is_reported(content, expect):
+    """The shape underneath all three: the loop used to `continue` past anything it
+    did not understand. Principle 6, in the file whose whole job is to say where a
+    value came from."""
+    values, problems = rnv_config._parse_dotenv(content)
+
+    assert values == {}
+    assert len(problems) == 1 and expect in problems[0], problems
+
+
+def test_an_unusable_dotenv_warns_and_does_not_gate(srv, blog, corpus, monkeypatch, tmp_path):
+    """§3.0.5. A .env line that could not be used does not mean the resolution is
+    wrong — the sibling rung may well be right — only that an answer the operator
+    thought they configured was not the one used. The path checks gate on what the
+    run actually needs; this explains a surprise rather than causing one."""
+    env_file(monkeypatch, tmp_path, b'\x00\xff not text at all\n', raw=True)
+
+    report = srv.config_report(for_real=True)
+
+    assert report["fatal"] is False, "an unusable .env stopped a run it did not break"
+    assert any("could not be read" in w or "not UTF-8" in w for w in report["warnings"]), \
+        report["warnings"]
+
+
+def test_a_healthy_dotenv_raises_no_warning(srv, blog, corpus, monkeypatch, tmp_path):
+    """The silent half. A warning that never goes quiet stops being read."""
+    env_file(monkeypatch, tmp_path, "# a comment\n\nSITE_URL=https://rnvizion.dev\n")
+
+    assert rnv_config.dotenv_problems() == []
+    assert srv.config_report(for_real=True)["warnings"] == []
+
+
+def test_describe_carries_the_dotenv_problems(monkeypatch, tmp_path):
+    """A wrong value and the reason it is wrong belong in the same report."""
+    env_file(monkeypatch, tmp_path, 'BLOG_REPO="/a\n')
+
+    assert "never closes" in rnv_config.describe()[".env"]["exists"]
+
+
+@pytest.mark.parametrize("content, expect", [
+    ('BLOG_REPO="C:/Users/John Smith/x"', {"BLOG_REPO": "C:/Users/John Smith/x"}),
+    ("BLOG_REPO=/a # note", {"BLOG_REPO": "/a"}),
+    ("SITE_URL=https://x.dev/?a=b", {"SITE_URL": "https://x.dev/?a=b"}),
+    pytest.param('BLOG_REPO="/a"  # the "real" one', {"BLOG_REPO": "/a"},
+                 id="quote-inside-the-comment-NEW"),
+    ("export BLOG_REPO=/a", {"BLOG_REPO": "/a"}),
+    ("BLOG_REPO = /a", {"BLOG_REPO": "/a"}),
+])
+def test_the_shapes_that_already_worked_still_do(content, expect):
+    """The regression guard on the rewrite: a fix is only a fix if what worked
+    still works.
+
+    FIVE of these six parsed correctly before 2026-09-22. The sixth — a quote
+    inside the trailing comment — did not, and this docstring claimed all six did
+    until the pre-fix run was read line by line instead of counted. The old parser
+    returned `'"/a"'` there, quotes intact, which is finding 1 again in a second
+    costume: the comment's last character is not the opening quote, so the quoted
+    branch was never taken. Marked rather than moved, because a regression guard
+    that quietly contains a new fix is a claim about scope that nobody can check.
+    """
+    assert rnv_config.parse_dotenv(content + "\n") == expect
