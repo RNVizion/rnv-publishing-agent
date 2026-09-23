@@ -196,3 +196,264 @@ def test_the_usage_block_does_not_reinstate_the_cwd_claim():
         "the retired cwd constraint is back in the usage block"
     assert "run this from the agent repo" not in source, \
         "a fix line still tells the reader to change directory"
+
+
+# ==========================================================================
+# The three findings of 2026-09-22, found by sweeping the same file after the
+# Brand & Corporate Architect's note. Each was reproduced by running before it
+# was changed; each reproduction is the test below it.
+#
+# These use the real git fixtures, so they are slower than the pure-function
+# tests above and they widen what this file touches: a git repo and a local
+# bare remote, but still no network and no real checkout. The 2026-08-29
+# manual-only ruling was narrowed on 2026-09-22 to exclude verdict composition;
+# it is narrowed once more here to exclude git behaviour a fixture can stage.
+# What stays manual is the part that reads the OPERATOR'S machine — their real
+# checkout, their credentials, their interpreter.
+
+import os
+from conftest import _run, plant_post_shape, write_post
+
+# A library that actually answers, for the tests that are about a post being
+# refused. conftest's default returns [] by design; a test asserting a refusal
+# against it would pass for the wrong reason.
+ANSWERING_SHAPE = """\
+import re
+
+
+def sibling_refs(html):
+    return [m for m in re.findall(r'(?:src|href)="([^"/:#][^":]*)"', html)]
+
+
+def shown_outside_code(html):
+    return []
+"""
+
+
+def paths_of(blog):
+    return {"BLOG_REPO": blog, "CORPUS_REPO": None}
+
+
+def post_with(blog, site, slug, body):
+    write_post(blog, slug, site)
+    path = blog / "blog" / slug / "index.html"
+    path.write_text(path.read_text(encoding="utf-8").replace("</article>", body + "</article>"),
+                    encoding="utf-8")
+    return path
+
+
+# --- Finding 1: READY was a claim about scope, not only about outcome. -----
+
+def test_a_post_whose_references_resolve_beside_it_is_refused(pf, blog, site, capsys):
+    """The reproduction. Before 2026-09-22 preflight printed READY and handed over
+    the for_real command for a post validate_post refuses outright."""
+    plant_post_shape(blog, body=ANSWERING_SHAPE)
+    post_with(blog, site, "probe", '<img src="diagram.png" alt="x">')
+
+    pf.check_post(paths_of(blog), "probe")
+
+    out = capsys.readouterr().out
+    assert "references resolve beside the post" in out, out
+    assert pf.problems, "it did not count as a problem, so the banner still says READY"
+
+
+def test_the_shape_verdict_matches_validate_posts(pf, blog, site, capsys):
+    """Agreement is the point: preflight exists to predict validate_post. Both
+    answers come from the same library, so this pins that they stay one answer."""
+    import server
+    plant_post_shape(blog, body=ANSWERING_SHAPE)
+    post_with(blog, site, "probe", '<img src="diagram.png" alt="x">')
+
+    pf.check_post(paths_of(blog), "probe")
+    capsys.readouterr()
+
+    assert server.validate_post("probe")["error"] == "sibling"
+    assert any("beside the post" in p for p in pf.problems), pf.problems
+
+
+def test_a_clean_post_says_so_and_does_not_warn(pf, blog, site, capsys):
+    """The silent half. A check that never goes quiet stops being read."""
+    write_post(blog, "probe", site)
+
+    pf.check_post(paths_of(blog), "probe")
+
+    out = capsys.readouterr().out
+    assert "no references resolve beside the post" in out, out
+    assert pf.problems == [] and pf.warnings == []
+
+
+def test_a_checkout_without_the_library_warns_rather_than_failing(pf, blog, site, capsys):
+    """A site checkout predating 2026-09-20 has no library. That is a gap in this
+    check, never a verdict about the post — §3.0.5, and does waiting fix it? A
+    pull does."""
+    write_post(blog, "probe", site)
+    (blog / "scripts" / "post_shape.py").unlink()
+
+    pf.check_post(paths_of(blog), "probe")
+
+    out = capsys.readouterr().out
+    assert "post-shape rule not checked" in out, out
+    assert pf.problems == [], "a missing library was reported as a bad post"
+    assert pf.warnings, "the gap was not reported at all"
+
+
+def test_a_library_that_exits_on_import_does_not_end_the_run(pf, blog, site, capsys):
+    """SystemExit is not an Exception. The site chat's real version of this killed
+    a caller over a defect in a different post."""
+    write_post(blog, "probe", site)
+    plant_post_shape(blog, body="import sys\nsys.exit(3)\n")
+
+    pf.check_post(paths_of(blog), "probe")
+
+    assert "post-shape rule not checked" in capsys.readouterr().out
+    assert pf.problems == []
+
+
+def test_the_run_names_the_rule_it_did_not_check(pf, blog, site, capsys):
+    """The allowlist lives in server.py and cannot be imported here. Naming the
+    gap is the honest move; copying the allowlist would be a second definition."""
+    write_post(blog, "probe", site)
+
+    pf.check_post(paths_of(blog), "probe")
+
+    assert "not checked here" in capsys.readouterr().out
+
+
+def test_the_shape_rule_is_imported_rather_than_reimplemented():
+    """Principle 18. A copy would drift, and the rule's semantics moved twice in
+    three days in September."""
+    source = PREFLIGHT.read_text(encoding="utf-8")
+    assert "post_shape.py" in source and "sibling_refs" in source
+    assert "def sibling_refs" not in source, "preflight grew its own copy of the rule"
+
+
+def test_the_ready_banner_states_its_scope(blog, site, tmp_path):
+    """A banner is a claim about scope as much as about outcome."""
+    write_post(blog, "probe", site)
+    env = {**os.environ, "BLOG_REPO": str(blog), "SITE_URL": site,
+           "CORPUS_REPO": str(tmp_path), "SITE_URL": site}
+
+    run = subprocess.run([sys.executable, str(PREFLIGHT), "--slug", "probe"],
+                         cwd=tmp_path, capture_output=True, text=True,
+                         timeout=120, env=env)
+
+    banner = [l for l in run.stdout.splitlines() if l.startswith("READY")]
+    assert len(banner) == 1, run.stdout[-400:]
+    assert "every check passed" not in banner[0], \
+        f"the banner still claims every check passed about a partly-checked post: {banner[0]}"
+    assert "passed every check made here" in banner[0], banner[0]
+    assert "validate_post is the authority" in run.stdout, run.stdout[-600:]
+
+
+# --- Finding 2: a claim about what commit_and_push does. ------------------
+
+def test_the_branch_warning_does_not_claim_your_branch_is_pushed(pf, blog, capsys):
+    """commit_and_push pushed the current branch until 2026-09-18; since then it
+    builds its commit on main and pushes <sha>:refs/heads/main regardless. The
+    warning said otherwise for four days, in the file whose job is to be right
+    about what the publish will do."""
+    _run(["git", "checkout", "-qb", "draft"], blog)
+
+    pf.check_git(paths_of(blog), push_check=False)
+
+    out = capsys.readouterr().out
+    assert "not on main" in out
+    assert "pushes the current branch" not in out, \
+        "the retired claim about commit_and_push is back"
+    assert "still goes to main" in out, out
+
+
+# --- Finding 3: the push check asked a question it did not mean. ----------
+
+def test_a_remote_that_moved_is_not_reported_as_a_push_failure(pf, blog, blog_remote, tmp_path, capsys):
+    """The reproduction, and this is the pipeline's NORMAL state: the site's own
+    Actions push to main on every publish. The old bare `git push --dry-run`
+    failed here and captioned it 'configure credentials'."""
+    other = tmp_path / "other"
+    _run(["git", "clone", "-q", str(blog_remote), str(other)], tmp_path)
+    _run(["git", "config", "user.email", "t@t"], other)
+    _run(["git", "config", "user.name", "t"], other)
+    (other / "OTHER").write_text("bot\n", encoding="utf-8")
+    _run(["git", "add", "-A"], other)
+    _run(["git", "commit", "-qm", "github-actions[bot]: rebuild derivatives"], other)
+    _run(["git", "push", "-q", "origin", "main"], other)
+
+    stale = subprocess.run(["git", "push", "--dry-run"], cwd=blog,
+                           capture_output=True, text=True)
+    assert stale.returncode != 0, \
+        "fixture did not diverge: the old check would not have failed here either"
+
+    pf.check_git(paths_of(blog), push_check=True)
+
+    out = capsys.readouterr().out
+    assert "push access confirmed" in out, out
+    assert pf.problems == [], f"a moved remote was reported as a problem: {pf.problems}"
+
+
+def test_an_unreachable_remote_is_still_a_push_failure(pf, blog, capsys):
+    """The other half. A check that cannot fail is not a check."""
+    _run(["git", "remote", "set-url", "origin", "/nonexistent/repo.git"], blog)
+
+    pf.check_git(paths_of(blog), push_check=True)
+
+    out = capsys.readouterr().out
+    assert "cannot write to the site repo" in out, out
+    assert pf.problems, "an unreachable remote passed the push check"
+
+
+def test_the_push_check_does_not_name_credentials_as_the_cause(pf, blog, capsys):
+    """The 2026-09-18 ruling, which server.py received and this file did not:
+    the write-permission hint is reserved for errors that name access."""
+    _run(["git", "remote", "set-url", "origin", "/nonexistent/repo.git"], blog)
+
+    pf.check_git(paths_of(blog), push_check=True)
+
+    out = capsys.readouterr().out
+    assert "configure credentials;" not in out, \
+        "the unconditional credentials caption is back"
+    assert "read it rather than assuming" in out, out
+
+
+def test_the_push_check_leaves_no_ref_on_the_remote(pf, blog, blog_remote, capsys):
+    """It probes by dry-running a NEW ref, which is the only push that cannot
+    fail on divergence. --dry-run must mean it."""
+    pf.check_git(paths_of(blog), push_check=True)
+    capsys.readouterr()
+
+    refs = _run(["git", "for-each-ref", "--format=%(refname)"], blog_remote).stdout
+    assert "preflight_probe" not in refs, f"the probe ref was really created:\n{refs}"
+
+
+def test_the_scope_note_survives_a_not_ready_verdict(blog, site, tmp_path):
+    """Found by the test above while it was still wrong itself. The scope note
+    lived inside the READY branch, so a run failing for an unrelated reason said
+    nothing about who the authority on the post is — and that is the run someone
+    is most likely to be staring at. The fix belonged in the code."""
+    write_post(blog, "probe", site)
+    env = {**os.environ, "BLOG_REPO": str(blog), "SITE_URL": site,
+           "CORPUS_REPO": str(tmp_path / "definitely-not-here")}
+
+    run = subprocess.run([sys.executable, str(PREFLIGHT), "--slug", "probe"],
+                         cwd=tmp_path, capture_output=True, text=True,
+                         timeout=120, env=env)
+
+    assert "NOT READY" in run.stdout, "fixture did not produce the verdict under test"
+    assert "validate_post is the authority" in run.stdout, \
+        "a NOT READY run said nothing about what it did and did not check"
+
+
+def test_the_import_leaves_no_bytecode_in_the_operators_checkout(pf, blog, site, capsys):
+    """Found by a sabotage that passed. Python caches bytecode beside the source,
+    so importing the site's library writes scripts/__pycache__/ into somebody
+    else's repo — a diagnostic has no business creating files there, ignored or
+    not. server.py's loader has this guarded; preflight's copy of the mechanism
+    did not, which is the cost of the mechanism being local even when the rule
+    is imported."""
+    write_post(blog, "probe", site)
+    scripts = blog / "scripts"
+
+    pf.check_post(paths_of(blog), "probe")
+    capsys.readouterr()
+
+    assert not (scripts / "__pycache__").exists(), \
+        f"the import wrote into the site checkout: {[p.name for p in scripts.iterdir()]}"
