@@ -24,7 +24,7 @@ import pytest
 
 import rnv_config
 import server
-from conftest import write_post
+from conftest import plant_post_shape, write_post
 
 
 def log(repo):
@@ -310,3 +310,113 @@ def test_config_report_carries_the_resolution_and_its_provenance(blog, corpus, s
 
     assert set(r["resolved"]) == {"BLOG_REPO", "CORPUS_REPO", "SITE_URL"}
     assert all("from" in v for v in r["resolved"].values())
+
+
+# ==========================================================================
+# The gate checks what the run will actually need, on BOTH paths.
+#
+# Until 2026-09-22 config_report checked that each path resolved to a DIRECTORY,
+# when both stages fetch from and push to a git repo with an `origin`. It read as
+# closed while checking the cheaper half of its own precondition — the same shape
+# as the defect its own line-63 comment was written about, one layer up.
+#
+# The gap opened because the gate predates 2026-09-18, when update_corpus began
+# pushing rather than reading. A gate encodes an assumption about a neighbouring
+# system, and when that system's contract strengthens the gate is silently wrong
+# with nothing in either system pointing at it.
+
+def plain_dir(tmp_path, name, *children):
+    d = tmp_path / name
+    for c in children:
+        (d / c).mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_a_corpus_that_is_not_a_repo_stops_a_real_run(srv, blog, monkeypatch, tmp_path):
+    """The reproduction. This one is the expensive failure: the gate cleared it,
+    the post went live, and stage 5 died on `fatal: not a git repository`."""
+    monkeypatch.setenv("CORPUS_REPO", str(plain_dir(tmp_path, "corpus-plain")))
+
+    report = srv.config_report(for_real=True)
+
+    assert report["fatal"] is True, report
+    assert any("CORPUS_REPO" in p and "origin" in p for p in report["problems"]), report
+
+
+def test_a_site_repo_that_is_not_a_repo_stops_a_real_run(srv, corpus, monkeypatch, tmp_path):
+    """The cheaper failure, and it gets the same depth. It dies at
+    commit_and_push with nothing published — but you ration a check that costs
+    something, and this one is a local git call. The cost asymmetry decides where
+    the EXPENSIVE check lives, not whether the cheap one runs on both paths."""
+    monkeypatch.setenv("BLOG_REPO", str(plain_dir(tmp_path, "site-plain", "blog")))
+
+    report = srv.config_report(for_real=True)
+
+    assert report["fatal"] is True, report
+    assert any("BLOG_REPO" in p and "origin" in p for p in report["problems"]), report
+
+
+def test_a_repo_with_no_origin_stops_a_real_run(srv, blog, monkeypatch, tmp_path):
+    """"Is it a git repo" would still have been too cheap: the chain fetches from
+    and pushes to `origin`, and a repo without one clears every weaker check."""
+    lonely = tmp_path / "corpus-no-origin"
+    lonely.mkdir()
+    for cmd in (["git", "init", "-q", "-b", "main", "."],
+                ["git", "config", "user.email", "t@t"], ["git", "config", "user.name", "t"]):
+        subprocess.run(cmd, cwd=lonely, check=True, capture_output=True)
+    (lonely / "sources.json").write_text('{"sources": []}\n', encoding="utf-8")
+    monkeypatch.setenv("CORPUS_REPO", str(lonely))
+
+    report = srv.config_report(for_real=True)
+
+    assert report["fatal"] is True, report
+    assert any("origin" in p for p in report["problems"]), report
+
+
+def test_a_dry_run_still_validates_a_post_in_a_plain_folder(srv, monkeypatch, tmp_path, site):
+    """The decision that shaped the fix, pinned. A dry run reads the post off the
+    filesystem and never touches git, so it can honestly do its job without a
+    repo — the dry/real test is whether the run can do its work without the
+    value, not whether the value matters. Putting the git check in _path_problem
+    would set blog_fatal and stop validate_post from validating a readable post."""
+    folder = plain_dir(tmp_path, "site-plain", "blog")
+    plant_post_shape(folder)
+    write_post(folder, "ready", site)
+    monkeypatch.setenv("BLOG_REPO", str(folder))
+
+    assert srv.config_report(for_real=False)["blog_fatal"] is False
+    assert srv.validate_post("ready")["ok"] is True, "a readable post stopped validating"
+
+
+def test_a_missing_path_is_not_reported_as_a_missing_repo(srv, corpus, monkeypatch, tmp_path):
+    """No misattribution. Running git inside a directory that is not there reports
+    'not a git repository' about a path whose real problem is that it does not
+    exist — a config defect blamed on a different config defect, which is this
+    module's founding bug in miniature."""
+    monkeypatch.setenv("BLOG_REPO", str(tmp_path / "nowhere-at-all"))
+
+    report = srv.config_report(for_real=True)
+
+    said = " ".join(report["problems"])
+    assert "no directory at" in said, report
+    assert "origin" not in said, f"it also blamed the missing path for having no remote: {report}"
+
+
+def test_two_healthy_repos_say_nothing(srv, blog, corpus):
+    """The silent half. A check that never goes quiet stops being read."""
+    report = srv.config_report(for_real=True)
+    assert report == {**report, "ok": True, "fatal": False, "problems": [], "warnings": []}
+
+
+def test_the_message_carries_gits_own_words_and_the_provenance(srv, blog, monkeypatch, tmp_path):
+    """It does not classify. `git remote get-url origin` fails for both causes and
+    this reports what git said; a caption that names a cause can name the wrong
+    one, and that defect has been fixed twice in this repo already."""
+    monkeypatch.setenv("CORPUS_REPO", str(plain_dir(tmp_path, "corpus-plain")))
+
+    problem = next(p for p in srv.config_report(for_real=True)["problems"]
+                   if "CORPUS_REPO" in p)
+
+    assert "not a git repository" in problem, problem
+    assert "source: environment" in problem, "the provenance half of the diagnosis is missing"
