@@ -172,7 +172,17 @@ def check_environment() -> dict[str, Path | None]:
         line(OK, "SITE_URL", f"= {url}   [{how}]")
 
     if rnv_config.DOTENV_PATH.is_file():
-        line(OK, ".env present", str(rnv_config.DOTENV_PATH))
+        # Reported, not merely noted as present. Until 2026-09-22 a .env whose
+        # lines could not be parsed — a BOM, a stray quote — produced this exact
+        # `ok` line while its contents were silently discarded, and the resolution
+        # above reported the sibling rung with a straight face.
+        dot = rnv_config.dotenv_problems()
+        if dot:
+            for problem in dot:
+                warn(".env line unusable", problem,
+                     "the value you set there is NOT what resolved above")
+        else:
+            line(OK, ".env present", str(rnv_config.DOTENV_PATH))
 
     return resolved
 
