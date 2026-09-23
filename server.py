@@ -86,6 +86,48 @@ def _path_problem(var: str) -> str:
     return ""
 
 
+def _git_problem(var: str) -> str:
+    """Describe why a configured path is not a repo the chain can push to, or ''.
+
+    WHY THIS EXISTS, and it is the same sentence as _path_problem's one layer down.
+    Until 2026-09-22 the gate checked that each path resolved to a DIRECTORY, when
+    what both stages need is a git repository with an `origin` to fetch from and
+    push to. It therefore read as closed while looking at the cheaper half of its
+    own precondition, and cleared three states that cannot work, all reproduced:
+    a corpus that is a plain folder, a corpus that is a repo with no `origin`, and
+    a site repo that is a plain folder.
+
+    WHY THE GAP OPENED, which is the part worth keeping. The gate predates
+    2026-09-18, when update_corpus began fetching and pushing rather than reading.
+    A gate encodes an assumption about a neighbouring system, and when that
+    system's contract strengthens the gate is silently wrong with nothing in
+    either system pointing at it. The Brand & Corporate Architect's phrasing, kept
+    because it is better than this project's was.
+
+    ONE CALL, AND IT DOES NOT CLASSIFY. `git remote get-url origin` fails for both
+    causes — 128 for "not a git repository", 2 for "No such remote" — and this
+    reports git's own words rather than translating them. A caption that names a
+    cause is a caption that can name the wrong one; that defect has now been fixed
+    twice in this repo (2026-09-18 in the push hints, 2026-09-22 in preflight) and
+    is not being written a third time. Local only: no network, ~2 ms, which is why
+    it can sit in a gate that runs on every tool call.
+
+    WHY REACHABILITY IS NOT CHECKED HERE. Whether `origin` answers, and whether it
+    accepts a write, cost a network round trip each. config_report runs ahead of
+    every tool, including every dry run, and a gate that reaches the network makes
+    the cheap path expensive. That check is opt-in and lives in
+    `tools/preflight.py --push-check`, which covers both repos as of 2026-09-22.
+    """
+    path, how = resolve_path(var)
+    got = _git_in(path, "remote", "get-url", "origin")
+    if got.returncode == 0:
+        return ""
+    said = _stderr_or(got, "git gave no reason").splitlines()
+    return (f"{var}: {path} is not a git repository with an 'origin' remote, so "
+            f"the chain cannot fetch or push there — {said[0] if said else ''} "
+            f"(source: {how})")
+
+
 def config_report(for_real: bool = False) -> dict:
     """Check every path the chain will need, before the chain needs it.
 
@@ -105,7 +147,28 @@ def config_report(for_real: bool = False) -> dict:
     site = "" if re.match(r"^https?://[^\s/]+\.[^\s/]+", url) else \
            f"SITE_URL is not a usable origin: {url!r} (source: {url_how})"
 
-    deferred = [m for m in (corpus, site) if m]
+    # Only asked when the path itself is sound. Running git inside a directory
+    # that does not exist reports "not a git repository" about a path whose real
+    # problem is that it is not there — a config defect misattributed to a
+    # different config defect, which is this module's own founding bug in
+    # miniature.
+    blog_git = _git_problem("BLOG_REPO") if not blog else ""
+    corpus_git = _git_problem("CORPUS_REPO") if not corpus else ""
+
+    # BOTH git checks are DEFERRED, including the site repo's, and that is a
+    # decision rather than an oversight. A dry run reads the post off the
+    # filesystem and never touches git, so it can honestly do its job in a plain
+    # folder — the dry/real test is whether the run can do its work without the
+    # value, not whether the value is important. Putting blog_git in `problems`
+    # above would make `blog_fatal` true and stop validate_post from validating a
+    # post that is perfectly readable.
+    #
+    # The two paths get the same DEPTH even though their failures cost different
+    # amounts — the corpus dies at stage 5 with the post already live, the site
+    # repo dies at commit_and_push with nothing published. You ration a check that
+    # costs something, and this one is free. The asymmetry decides where the
+    # EXPENSIVE check goes, not whether the cheap one runs.
+    deferred = [m for m in (corpus, corpus_git, blog_git, site) if m]
     if for_real:
         problems.extend(deferred)
     else:
