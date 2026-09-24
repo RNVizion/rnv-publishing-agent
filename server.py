@@ -1020,11 +1020,21 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
         return {"slug": slug, "ok": False,
                 "error": f"{url} not reachable ({e}); run wait_for_live first"}
 
-    sources_path = corpus_repo() / "sources.json"
-    if not sources_path.exists():
-        return {"slug": slug, "ok": False,
-                "error": f"sources.json not found at {sources_path} — set CORPUS_REPO to your ask-the-corpus checkout"}
-
+    # THE CHECKOUT'S sources.json IS NOT ASKED ANYTHING, and until 2026-09-23 it
+    # was — a `sources_path.exists()` precondition that was the only reference to
+    # that path in the whole module. Everything real is read from `main` below,
+    # which is the point of the 2026-09-18 change and what this tool's own
+    # docstring says: a stale checkout no longer decides anything. So a corpus
+    # checkout on another branch, a sparse or --no-checkout clone, or one mid
+    # rebase refused a registration that is entirely a function of `main` — and
+    # the message blamed CORPUS_REPO, which was set correctly. Proven by deleting
+    # the four lines against the same fixture: the registration succeeds and the
+    # entry lands.
+    #
+    # Nothing replaces it, deliberately. A CORPUS_REPO that is not a pushable git
+    # repo is caught by the config gate (rev 14); a `main` with no sources.json is
+    # caught below with a message that says so; a fetch that cannot run is caught
+    # by the fetch. Three guards already cover what this one claimed to.
     tracking = f"refs/remotes/origin/{CORPUS_BRANCH}"
     for attempt in range(1, _REGISTER_ATTEMPTS + 1):
         fetch = _corpus_git("fetch", "--quiet", "origin", f"+refs/heads/{CORPUS_BRANCH}:{tracking}")
@@ -1044,8 +1054,50 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
                     "error": f"sources.json on {CORPUS_BRANCH} is not valid JSON ({e}); not writing over it"}
 
         sources = data.setdefault("sources", [])
-        if any(s.get("url") == url or s.get("id") == slug for s in sources):
+
+        # THE ENTRY IS {id, url}, SO BOTH HALVES DECIDE IT.
+        #
+        # Until 2026-09-23 this matched on `url == url OR id == slug` and reported
+        # the entry present when either half did. The entry it set out to write is
+        # {"id": slug, "url": url}; matching one half proves a DIFFERENT entry is
+        # there. Two states were reported as done, both reproduced:
+        #   - the slug registered under another URL form, so the corpus fetches an
+        #     address the post does not answer at — the stage-5 failure this tool
+        #     exists to prevent, reported as success
+        #   - this post's URL registered under another id, so it is retrievable
+        #     under a name nothing else uses
+        # Every re-run repeated the same green, because the condition that made it
+        # green never changed.
+        #
+        # A DISAGREEMENT IS REFUSED, NOT RESOLVED. The corpus has a second
+        # registrar and the id rule and URL form are the corpus project's, not
+        # this one's — scope table. Overwriting their URL would be this agent
+        # deciding whose form is right; appending a second entry with the same id
+        # would invent a state neither registrar expects. So it reports both
+        # entries and stops. Principle 10: when a tool cannot verify something it
+        # says so rather than guessing between the possibilities.
+        #
+        # It gates rather than warns because waiting never fixes it — §3.0.5's own
+        # test. A lagging registrar drains; a mismatched URL is a durable
+        # disagreement, and the publish has already happened either way, so the
+        # honest report is the whole value on offer.
+        if any(s.get("id") == slug and s.get("url") == url for s in sources):
             return {"slug": slug, "ok": True, "added": False, "reason": "already in sources.json"}
+
+        clashes = [s for s in sources
+                   if s.get("id") == slug or s.get("url") == url]
+        if clashes:
+            return {"slug": slug, "ok": False, "error": "entry disagreement",
+                    "wanted": {"id": slug, "url": url},
+                    "found_on_main": clashes,
+                    "note": f"{CORPUS_BRANCH} already carries an entry matching this post's "
+                            f"id or URL but not both, so the post is registered under "
+                            f"something other than {{id: {slug!r}, url: {url!r}}}. This tool "
+                            f"will not choose between them: the id rule and the URL form "
+                            f"belong to the corpus project, and the other registrar "
+                            f"(discover.py) writes the same file. Fix the entry on "
+                            f"{CORPUS_BRANCH} — or SITE_URL here, if that is what differs — "
+                            f"and run this again"}
         if dry_run:
             return {"slug": slug, "ok": True, "added": False, "would_add": {"id": slug, "url": url}}
 
