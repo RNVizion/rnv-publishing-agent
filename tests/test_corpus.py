@@ -301,3 +301,175 @@ def test_a_checkout_that_cannot_follow_warns_and_the_registration_stands(
     assert _ids_on_main(corpus_remote) == ["ready"], "the stranded commit was pushed along"
     assert _git(corpus, "rev-parse", "HEAD") == head_before, "the checkout's branch was rewritten"
     assert any("left where it was" in w for w in result.get("warnings", [])), result.get("warnings")
+
+
+# ==========================================================================
+# The two findings of 2026-09-23, both reproduced against `eb4f528`.
+#
+# Both are the same shape the 2026-09-18 change was about, surviving in two
+# places it did not reach: a claim decided from the wrong source, and a claim
+# decided from half its condition.
+
+def seed_main(corpus_remote, tmp_path, entries, name="otherreg"):
+    """Put arbitrary entries on the corpus main, the way discover.py would.
+
+    Unlike `_other_registrar_pushes`, the entry is given rather than derived, so a
+    test can stage an id and a URL that disagree. That helper always writes
+    `{"id": slug, "url": f"{site}/blog/{slug}/"}` — the identical form the agent
+    writes — which is exactly why the id-versus-url divergence was never exercised.
+    """
+    work = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(corpus_remote), str(work)],
+                   check=True, capture_output=True)
+    for key, value in (("user.email", "action@example.invalid"),
+                       ("user.name", "Workflow"), ("commit.gpgsign", "false")):
+        _git(work, "config", key, value)
+    path = work / "sources.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["sources"].extend(entries)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _git(work, "add", "sources.json")
+    _git(work, "commit", "-qm", "discover: add")
+    _git(work, "push", "-q", "origin", "main")
+
+
+def sources_on_main(corpus_remote):
+    out = subprocess.run(["git", "--git-dir", str(corpus_remote), "show", "main:sources.json"],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["sources"]
+
+
+# --- Finding A: half an entry reported as the whole one -------------------
+
+def test_the_slug_under_another_url_is_not_called_registered(blog, corpus, corpus_remote,
+                                                             site, srv, fake_web, tmp_path):
+    """The reproduction, and the expensive half. The corpus then fetches an address
+    the post does not answer at — the stage-5 failure this tool exists to prevent,
+    reported as success, and every re-run repeated it."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    seed_main(corpus_remote, tmp_path,
+              [{"id": "a-post", "url": "https://rnvizion.dev.old/blog/a-post/"}])
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is False, "a different entry was reported as this one"
+    assert result["error"] == "entry disagreement"
+    assert result["wanted"] == {"id": "a-post", "url": f"{site}/blog/a-post/"}
+    assert result["found_on_main"] == [{"id": "a-post",
+                                        "url": "https://rnvizion.dev.old/blog/a-post/"}]
+
+
+def test_this_url_under_another_id_is_not_called_registered(blog, corpus, corpus_remote,
+                                                            site, srv, fake_web, tmp_path):
+    """The other half of the same `or`. The post is retrievable under a name nothing
+    else uses."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    seed_main(corpus_remote, tmp_path,
+              [{"id": "typo-slug", "url": f"{site}/blog/a-post/"}])
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is False and result["error"] == "entry disagreement"
+    assert result["found_on_main"] == [{"id": "typo-slug", "url": f"{site}/blog/a-post/"}]
+
+
+def test_a_disagreement_writes_nothing(blog, corpus, corpus_remote, site, srv,
+                                       fake_web, tmp_path):
+    """It refuses rather than resolving. The id rule and the URL form belong to the
+    corpus project and a second registrar writes the same file, so overwriting
+    their entry would be this agent choosing whose form is right."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    theirs = [{"id": "a-post", "url": "https://rnvizion.dev.old/blog/a-post/"}]
+    seed_main(corpus_remote, tmp_path, theirs)
+
+    srv.update_corpus("a-post")
+
+    assert sources_on_main(corpus_remote) == theirs, "it rewrote the other registrar's entry"
+
+
+def test_a_disagreement_is_reported_by_a_dry_run_too(blog, corpus, corpus_remote,
+                                                     site, srv, fake_web, tmp_path):
+    """A dry run exists to say what a real run would do, so it must not report
+    `would_add` for a registration the real run refuses."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    seed_main(corpus_remote, tmp_path,
+              [{"id": "a-post", "url": "https://rnvizion.dev.old/blog/a-post/"}])
+
+    result = srv.update_corpus("a-post", dry_run=True)
+
+    assert result["ok"] is False and result["error"] == "entry disagreement"
+    assert "would_add" not in result
+
+
+def test_a_matching_entry_is_still_already_registered(blog, corpus, corpus_remote,
+                                                      site, srv, fake_web, tmp_path):
+    """The silent half. Both halves matching is the ordinary idempotent case and
+    must stay quiet — a check that refuses everything is not a check."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    _other_registrar_pushes(corpus_remote, tmp_path / "other", "a-post", site=site)
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is True and result["added"] is False
+    assert result["reason"] == "already in sources.json"
+
+
+def test_the_two_halves_of_one_entry_split_across_two_entries_still_disagree(
+        blog, corpus, corpus_remote, site, srv, fake_web, tmp_path):
+    """The case a per-half check would miss: the id on one entry, the URL on
+    another, and neither entry is the one this tool wanted."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    seed_main(corpus_remote, tmp_path,
+              [{"id": "a-post", "url": "https://rnvizion.dev.old/blog/a-post/"},
+               {"id": "typo-slug", "url": f"{site}/blog/a-post/"}])
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is False and len(result["found_on_main"]) == 2
+
+
+# --- Finding B: a precondition asked of the checkout ----------------------
+
+def test_a_checkout_without_sources_json_still_registers(blog, corpus, corpus_remote,
+                                                         site, srv, fake_web):
+    """The reproduction. `main` has the file, the checkout does not — another
+    branch, a sparse clone, a half-finished rebase — and the registration is
+    entirely a function of `main`. The refusal blamed CORPUS_REPO, which was set
+    correctly, in the tool whose own docstring says the checkout decides nothing."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    (corpus / "sources.json").unlink()
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is True, result
+    assert any(s["id"] == "a-post" for s in sources_on_main(corpus_remote))
+
+
+def test_a_main_without_sources_json_is_still_refused(blog, corpus, corpus_remote,
+                                                      site, srv, fake_web, tmp_path):
+    """Nothing replaced the deleted precondition, so this pins that the guard which
+    actually mattered is still there — and that it names `main`, not the checkout."""
+    write_post(blog, "a-post", site)
+    fake_web[f"{site}/blog/a-post/"] = 200
+    work = tmp_path / "wipe"
+    subprocess.run(["git", "clone", "-q", str(corpus_remote), str(work)],
+                   check=True, capture_output=True)
+    for key, value in (("user.email", "a@b.invalid"), ("user.name", "W"),
+                       ("commit.gpgsign", "false")):
+        _git(work, "config", key, value)
+    (work / "sources.json").unlink()
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "drop sources.json")
+    _git(work, "push", "-q", "origin", "main")
+
+    result = srv.update_corpus("a-post")
+
+    assert result["ok"] is False
+    assert "main" in result["error"] and "sources.json" in result["error"], result["error"]
